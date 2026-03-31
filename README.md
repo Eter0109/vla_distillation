@@ -67,13 +67,10 @@ student:
 bash scripts/train_distill.sh
 
 # 自定义设备和超参
+TEACHER_DEVICE=5 STUDENT_DEVICES=4 \
 bash scripts/train_distill.sh \
-    --teacher_device cuda:1 \
-    --student_devices 2,3,4,5 \
-    --alpha 0.5 \
-    --batch_size 8 \
-    --steps 30000 \
-    --accum_steps 4
+--batch_size 1 \
+--steps 10
 
 # 仅任务损失（无蒸馏）
 bash scripts/train_distill.sh --feature_distill false --logit_distill false

@@ -1,721 +1,655 @@
+#!/usr/bin/env python
 """
-蒸馏训练核心逻辑（src/distill.py）
+VLA 蒸馏训练脚本（src/distill.py）
 
-功能：
-- 教师模型（XVLA）单卡半精度推理，冻结参数
-- 学生模型（SmolVLA）多卡 DDP 训练，混合精度 + 梯度检查点 + 梯度累积
-- 多层特征蒸馏 + 输出层 Logit 蒸馏（开关可配）
-- 损失 = alpha_task * MSE(学生动作, GT动作) + alpha_distill * 蒸馏损失
-- 支持通过命令行覆盖 YAML 配置项
+结构完全对齐 lerobot/scripts/lerobot_train.py：
+- 配置：DistillTrainPipelineConfig 继承 TrainPipelineConfig + @parser.wrap()
+- 更新函数：update_distill 对应 update_policy
+- 主函数：train_distill 对应 train，结构、命名与 lerobot_train.py 一致
+- 工具：MetricsTracker / AverageMeter / WandBLogger / save_checkpoint
+
+教师模型（XVLA）：
+  - 仅主进程加载，fp16 冻结推理，部署在 teacher_device（默认 cuda:1）
+  - 中间特征通过 accelerator.broadcast 同步到所有 DDP 进程
+
+学生模型（SmolVLA）：
+  - accelerator.prepare 封装 DDP + AMP
+  - 与 DistillAdapters 联合优化
 """
 
-from __future__ import annotations
-
-import argparse
+import dataclasses
 import logging
-import math
-import os
-import sys
 import time
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
+from pprint import pformat
+from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
-from torch import nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+from termcolor import colored
+from torch.optim import Optimizer
+from tqdm import tqdm
 
-import yaml
+# LeRobot 核心模块
+from lerobot.configs import parser
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.utils import cycle
+from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+from lerobot.policies.pretrained import PreTrainedPolicy
+try:
+    from lerobot.rl.wandb_utils import WandBLogger
+except ImportError:
+    WandBLogger = None
+from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.utils.random_utils import set_seed
+from lerobot.utils.train_utils import (
+    get_step_checkpoint_dir,
+    get_step_identifier,
+    load_training_state,
+    save_checkpoint,
+    update_last_checkpoint,
+)
+from lerobot.utils.utils import (
+    format_big_number,
+    init_logging,
+    inside_slurm,
+)
 
-# 添加 lerobot 到路径
-LEROBOT_ROOT = "/hqlab/workspace/zhaozy/lerobot/src"
-if LEROBOT_ROOT not in sys.path:
-    sys.path.insert(0, LEROBOT_ROOT)
-
-PROJECT_SRC = Path(__file__).parent
-if str(PROJECT_SRC) not in sys.path:
-    sys.path.insert(0, str(PROJECT_SRC))
-
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.policies.factory import get_policy_class
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
-
+# 自定义蒸馏模块
 from adapters import DistillAdapters, align_seq_len
 from hooks import MultiHookManager
 
 
 # =============================================================================
-# 工具函数
+# 配置扩展
 # =============================================================================
 
-def setup_logging(log_file: str, rank: int) -> logging.Logger:
-    """配置日志：主进程写文件+控制台，其他进程仅控制台。"""
-    logger = logging.getLogger("distill")
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-
-    if rank == 0:
-        os.makedirs(Path(log_file).parent, exist_ok=True)
-        fh = logging.FileHandler(log_file)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-    return logger
-
-
-def load_config(config_path: str) -> dict:
-    """从 YAML 文件加载配置。"""
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def parse_args() -> argparse.Namespace:
-    """解析命令行参数，支持覆盖 YAML 配置。"""
-    parser = argparse.ArgumentParser(description="VLA 蒸馏训练 SmolVLA <- XVLA")
-    parser.add_argument("--config", type=str, default="configs/distill_config.yaml", help="YAML 配置文件路径")
-
-    # 命令行覆盖项
-    parser.add_argument("--teacher_device", type=str, default=None, help="教师模型部署卡，如 cuda:1")
-    parser.add_argument("--student_devices", type=str, default=None, help="学生训练卡，如 2,3,4,5")
-    parser.add_argument("--alpha", type=float, default=None, help="蒸馏损失总权重 alpha_distill")
-    parser.add_argument("--batch_size", type=int, default=None, help="每卡 batch size")
-    parser.add_argument("--steps", type=int, default=None, help="总训练步数")
-    parser.add_argument("--lr", type=float, default=None, help="学习率")
-    parser.add_argument("--accum_steps", type=int, default=None, help="梯度累积步数")
-    parser.add_argument("--grad_ckpt", type=lambda x: x.lower() == "true", default=None, help="是否启用梯度检查点")
-    parser.add_argument("--feature_distill", type=lambda x: x.lower() == "true", default=None, help="是否启用特征蒸馏")
-    parser.add_argument("--logit_distill", type=lambda x: x.lower() == "true", default=None, help="是否启用 logit 蒸馏")
-    parser.add_argument("--dataset_path", type=str, default=None, help="本地数据集路径")
-    parser.add_argument("--output_dir", type=str, default=None, help="输出目录")
-    parser.add_argument("--student_cuda_offset", type=int, default=0, help="学生 local_rank 相对于 CUDA_VISIBLE_DEVICES 的偏移（教师占据前 N 个槽位时使用）")
-    # DDP 通信参数（由 torchrun 自动注入）
-    parser.add_argument("--local_rank", type=int, default=-1)
-
-    return parser.parse_args()
+@dataclass
+class DistillConfig:
+    """蒸馏超参，作为 DistillTrainPipelineConfig 的子字段。"""
+    # 损失权重
+    alpha_task: float = 1.0
+    alpha_distill: float = 0.5
+    alpha_feature: float = 0.4
+    alpha_logit: float = 0.6
+    # 蒸馏开关
+    feature_distill: bool = True
+    logit_distill: bool = True
+    # 预热：warmup 期间只用 task loss
+    warmup_steps: int = 500
+    temperature: float = 2.0
+    # 教师模型
+    teacher_path: str = ""
+    teacher_device: str = "cuda:1"
+    teacher_dtype: str = "float16"
+    # 适配层维度
+    student_vision_dim: int = 576
+    teacher_vision_dim: int = 1024
+    student_expert_dim: int = 288
+    teacher_expert_dim: int = 1024
+    student_action_dim: int = 7
+    teacher_action_dim: int = 20
 
 
-def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
-    """将命令行参数覆盖到配置字典中。"""
-    if args.teacher_device:
-        cfg["teacher"]["device"] = args.teacher_device
-    if args.student_devices:
-        devices = [int(d) for d in args.student_devices.split(",")]
-        cfg["student"]["devices"] = devices
-    if args.alpha is not None:
-        cfg["distillation"]["alpha_distill"] = args.alpha
-    if args.batch_size is not None:
-        cfg["training"]["batch_size"] = args.batch_size
-    if args.steps is not None:
-        cfg["training"]["total_steps"] = args.steps
-    if args.lr is not None:
-        cfg["training"]["learning_rate"] = args.lr
-    if args.accum_steps is not None:
-        cfg["training"]["accum_steps"] = args.accum_steps
-    if args.grad_ckpt is not None:
-        cfg["student"]["use_gradient_checkpointing"] = args.grad_ckpt
-    if args.feature_distill is not None:
-        cfg["distillation"]["enable_feature_distill"] = args.feature_distill
-    if args.logit_distill is not None:
-        cfg["distillation"]["enable_logit_distill"] = args.logit_distill
-    if args.dataset_path:
-        cfg["dataset"]["path"] = args.dataset_path
-    if args.output_dir:
-        cfg["paths"]["output_dir"] = args.output_dir
-        cfg["paths"]["checkpoint_dir"] = str(Path(args.output_dir) / "checkpoints")
-    if hasattr(args, "student_cuda_offset") and args.student_cuda_offset:
-        cfg["student"]["cuda_offset"] = args.student_cuda_offset
-    return cfg
+@dataclass
+class DistillTrainPipelineConfig(TrainPipelineConfig):
+    """在 LeRobot TrainPipelineConfig 基础上追加蒸馏配置。"""
+    distill: DistillConfig = field(default_factory=DistillConfig)
+    # 学生模型路径（同 policy.pretrained_path，单独保留以兼容现有 YAML）
+    student_path: str = ""
+    # 梯度累积步数
+    grad_accum_steps: int = 1
 
+    def validate(self) -> None:
+        # 跳过父类对 policy 的强制检验（蒸馏场景下 policy 由 student_path 控制）
+        import datetime as dt
+        if not self.job_name:
+            self.job_name = "distill_smolvla"
+        if not self.output_dir:
+            now = dt.datetime.now()
+            self.output_dir = Path("outputs/train") / f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
+        if self.resume and self.output_dir and not Path(self.output_dir).is_dir():
+            raise NotADirectoryError(f"resume=True 但 output_dir 不存在: {self.output_dir}")
 
-def validate_paths(cfg: dict, logger: logging.Logger) -> None:
-    """检查关键路径是否存在。"""
-    errors = []
-    teacher_path = cfg["teacher"]["path"]
-    student_path = cfg["student"]["path"]
-    dataset_path = cfg["dataset"]["path"]
-
-    if not Path(teacher_path).exists():
-        errors.append(f"教师模型路径不存在: {teacher_path}")
-    if not Path(student_path).exists():
-        errors.append(f"学生模型路径不存在: {student_path}")
-    if not Path(dataset_path).exists():
-        errors.append(f"数据集路径不存在: {dataset_path}")
-
-    if errors:
-        for e in errors:
-            logger.error(e)
-        raise FileNotFoundError("\n".join(errors))
-
-
-def setup_ddp(local_rank: int, student_cuda_offset: int = 0) -> int:
-    """初始化 DDP 进程组，返回全局 rank。"""
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(local_rank + student_cuda_offset)
-    return rank, world_size
-
-
-def cleanup_ddp():
-    """销毁 DDP 进程组。"""
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    @classmethod
+    def __get_path_fields__(cls) -> list[str]:
+        # 不走 policy 路径加载
+        return []
 
 
 # =============================================================================
 # 模型加载
 # =============================================================================
 
-def load_teacher(cfg: dict, rank: int, logger: logging.Logger) -> XVLAPolicy | None:
-    """加载教师模型到指定卡；为避免 OOM，仅 rank0 持有教师。"""
-    if rank != 0:
-        logger.info("非主 rank 跳过教师模型加载，仅计算 task loss")
+def load_teacher(cfg: DistillTrainPipelineConfig, accelerator: Accelerator) -> PreTrainedPolicy | None:
+    """加载教师模型（仅主进程），fp16 冻结部署在 teacher_device。"""
+    if not accelerator.is_main_process:
         return None
 
-    teacher_path = cfg["teacher"]["path"]
-    teacher_device = cfg["teacher"]["device"]
-    teacher_dtype_name = str(cfg["teacher"].get("dtype", "float16")).lower()
-    teacher_dtype = {
-        "float16": torch.float16,
-        "fp16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float32": torch.float32,
-        "fp32": torch.float32,
-    }.get(teacher_dtype_name, torch.float16)
+    dc = cfg.distill
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    teacher_dtype = dtype_map[dc.teacher_dtype.lower()]
 
-    logger.info(f"加载教师模型: {teacher_path} -> {teacher_device} ({teacher_dtype_name})")
-    teacher = XVLAPolicy.from_pretrained(teacher_path, dtype=teacher_dtype)
-    teacher = teacher.to(device=teacher_device, dtype=teacher_dtype)
-
-    # 冻结所有参数
-    for param in teacher.parameters():
-        param.requires_grad = False
+    logging.info(colored(f"加载教师模型: {dc.teacher_path}", "blue"))
+    teacher_cls = get_policy_class("xvla")
+    teacher = teacher_cls.from_pretrained(dc.teacher_path)
+    teacher = teacher.to(device=dc.teacher_device, dtype=teacher_dtype)
+    for p in teacher.parameters():
+        p.requires_grad = False
     teacher.eval()
-
-    logger.info(f"教师模型参数已冻结，部署在 {teacher_device}")
+    logging.info(colored(f"教师模型已就绪: {dc.teacher_device} ({teacher_dtype})", "green"))
     return teacher
 
 
-def load_student(cfg: dict, local_rank: int, logger: logging.Logger) -> SmolVLAPolicy:
-    """加载学生模型，移动到当前卡，（可选）启用梯度检查点。"""
-    student_path = cfg["student"]["path"]
-    # 支持教师模型占据 cuda:0 的情况，学生卡从 offset 开始
-    cuda_offset = cfg["student"].get("cuda_offset", 0)
-    student_device = f"cuda:{local_rank + cuda_offset}"
+def load_student(cfg: DistillTrainPipelineConfig) -> PreTrainedPolicy:
+    """加载学生模型（SmolVLA），启用梯度检查点。"""
+    path = cfg.student_path
+    logging.info(colored(f"加载学生模型: {path}", "blue"))
+    student_cls = get_policy_class("smolvla")
+    student = student_cls.from_pretrained(path)
 
-    logger.info(f"加载学生模型: {student_path} -> {student_device}")
-    student = SmolVLAPolicy.from_pretrained(student_path)
-    student = student.to(student_device)
-
-    # 启用梯度检查点（节省显存）
-    if cfg["student"].get("use_gradient_checkpointing", False):
-        vlm_model = student.model.vlm_with_expert
-        if hasattr(vlm_model.vlm, "gradient_checkpointing_enable"):
-            vlm_model.vlm.gradient_checkpointing_enable()
-            logger.info("已启用学生 VLM 梯度检查点")
-        if hasattr(vlm_model.lm_expert, "gradient_checkpointing_enable"):
-            vlm_model.lm_expert.gradient_checkpointing_enable()
-            logger.info("已启用学生 lm_expert 梯度检查点")
+    vlm = getattr(student.model.vlm_with_expert, "vlm", None)
+    lm_expert = getattr(student.model.vlm_with_expert, "lm_expert", None)
+    if vlm is not None and hasattr(vlm, "gradient_checkpointing_enable"):
+        vlm.gradient_checkpointing_enable()
+        logging.info("学生 VLM 梯度检查点已启用")
+    if lm_expert is not None and hasattr(lm_expert, "gradient_checkpointing_enable"):
+        lm_expert.gradient_checkpointing_enable()
+        logging.info("学生 lm_expert 梯度检查点已启用")
 
     student.train()
     return student
 
 
 # =============================================================================
-# 数据集
+# 单步蒸馏更新（对应 lerobot_train.update_policy）
 # =============================================================================
 
-def build_dataloader(cfg: dict, rank: int, world_size: int) -> DataLoader:
-    """构建分布式 DataLoader。"""
-    dataset_path = cfg["dataset"]["path"]
-    repo_id = cfg["dataset"]["repo_id"]
-    delta_timestamps = cfg["dataloader"]["delta_timestamps"]
-
-    # 当前 lerobot 版本不支持 local_files_only，直接按本地 root + repo_id 加载
-    try:
-        _ = LeRobotDatasetMetadata(repo_id, root=dataset_path)
-        dataset = LeRobotDataset(
-            repo_id=repo_id,
-            root=dataset_path,
-            delta_timestamps=delta_timestamps,
-        )
-    except Exception:
-        # 回退：直接用 path 作为 repo_id
-        dataset = LeRobotDataset(
-            repo_id=dataset_path,
-            delta_timestamps=delta_timestamps,
-        )
-
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg["training"]["batch_size"],
-        sampler=sampler,
-        num_workers=cfg["dataloader"]["num_workers"],
-        pin_memory=cfg["dataloader"].get("pin_memory", True),
-        drop_last=True,
-    )
-    return loader, sampler
-
-
-# =============================================================================
-# 损失计算
-# =============================================================================
-
-def compute_distill_loss(
-    student: SmolVLAPolicy,
-    teacher: XVLAPolicy | None,
-    batch: dict,
+def update_distill(
+    train_metrics: MetricsTracker,
+    student: PreTrainedPolicy,
+    teacher: PreTrainedPolicy | None,
+    student_batch: dict,
+    teacher_batch: dict | None,
     adapters: DistillAdapters,
-    cfg: dict,
-    teacher_device: str,
-    student_device: str,
+    optimizer: Optimizer,
+    grad_clip_norm: float,
     step: int,
-    logger: logging.Logger,
-) -> tuple[torch.Tensor, dict]:
-    """计算完整蒸馏损失。
+    cfg: DistillTrainPipelineConfig,
+    accelerator: Accelerator,
+    lr_scheduler=None,
+) -> tuple[MetricsTracker, dict]:
+    """
+    执行一步蒸馏前向+反向+优化（梯度累积由 accelerator.accumulate 管理）。
 
     Returns:
-        total_loss: 标量张量（在学生设备上）
-        log_info: 各项损失的数值字典
+        更新后的 MetricsTracker，以及包含各分项 loss 的 output_dict。
     """
-    distill_cfg = cfg["distillation"]
-    alpha_task = distill_cfg["alpha_task"]
-    alpha_distill = distill_cfg["alpha_distill"]
-    alpha_logit = distill_cfg.get("alpha_logit", 0.6)
-    alpha_feature = distill_cfg.get("alpha_feature", 0.4)
-    warmup_steps = distill_cfg.get("warmup_steps", 0)
-    temperature = distill_cfg.get("temperature", 2.0)
-    enable_logit = distill_cfg.get("enable_logit_distill", True)
-    enable_feature = distill_cfg.get("enable_feature_distill", True)
+    t0 = time.perf_counter()
+    dc = cfg.distill
+    in_warmup = step < dc.warmup_steps
+    log = {}
 
-    # 是否在预热阶段（仅使用任务损失）
-    in_warmup = step < warmup_steps
+    student.train()
 
-    # -------------------------------------------------------------------
-    # 1. 学生模型前向（任务损失）
-    # -------------------------------------------------------------------
-    # 将 batch 移动到学生设备
-    student_batch = {k: v.to(student_device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    with accelerator.accumulate(student, adapters):
+        # ── 1. 学生任务损失 ──────────────────────────────────────────────────
+        with accelerator.autocast():
+            task_loss, student_out = student.forward(student_batch)
+            task_loss = task_loss.float()
 
-    # 注册学生中间层 hook
-    hook_modules = {}
-    # 在 DDP 包装下，通过 student.module 访问原始模型属性
-    student_module = student.module if isinstance(student, DDP) else student
-    if enable_feature and not in_warmup:
-        vlm_expert = student_module.model.vlm_with_expert
-        hook_modules["student_vision"] = vlm_expert.vlm.model.vision_model
-        hook_modules["student_last"] = vlm_expert.lm_expert.layers[-1]
+        # ── 2. 蒸馏损失 ─────────────────────────────────────────────────────
+        distill_loss = torch.zeros(1, device=accelerator.device)
 
-    with MultiHookManager(hook_modules) as student_hooks:
-        # 学生 forward：返回 (task_loss, loss_dict)
-        student_task_loss, student_loss_dict = student.forward(student_batch)
+        if not in_warmup and (dc.feature_distill or dc.logit_distill):
+            # 学生预测动作（logit distill 用）
+            student_pred_action = None
+            if dc.logit_distill:
+                with torch.no_grad(), accelerator.autocast():
+                    images, img_masks = student.prepare_images(student_batch)
+                    state = student.prepare_state(student_batch)
+                    lang_tokens = student_batch["obs.language_tokens"]
+                    lang_masks = student_batch["obs.language_attention_mask"]
+                    student_pred_action = student.model.sample_actions(
+                        images, img_masks, lang_tokens, lang_masks, state
+                    ).detach()
+                    student_pred_action = student_pred_action[..., : dc.student_action_dim]
 
-    # -------------------------------------------------------------------
-    # 2. 获取学生预测动作（用于 logit 蒸馏）
-    # -------------------------------------------------------------------
-    student_pred_action = None
-    if enable_logit and not in_warmup:
-        with torch.no_grad():
-            # sample_actions 返回 (B, chunk_size, action_dim)
-            images, img_masks = student_module.prepare_images(student_batch)
-            state = student_module.prepare_state(student_batch)
-            lang_tokens = student_batch[OBS_LANGUAGE_TOKENS]
-            lang_masks = student_batch[OBS_LANGUAGE_ATTENTION_MASK]
-            student_pred_action = student_module.model.sample_actions(
-                images, img_masks, lang_tokens, lang_masks, state
-            ).detach()
-            # 截断到真实动作维度
-            real_action_dim = cfg["student"]["action_dim"]
-            student_pred_action = student_pred_action[:, :, :real_action_dim]
+            # 学生 hook 模块
+            s_hook_modules = {}
+            if dc.feature_distill:
+                s_hook_modules = {
+                    "student_vision": student.model.vlm_with_expert.vlm.model.vision_model,
+                    "student_last": student.model.vlm_with_expert.lm_expert.layers[-1],
+                }
 
-    # -------------------------------------------------------------------
-    # 3. 教师模型前向（仅推理，AMP 半精度）
-    # -------------------------------------------------------------------
-    teacher_vision_feat = None
-    teacher_last_feat = None
-    teacher_pred_action = None
+            # 教师推理（仅主进程）
+            t_vision = None
+            t_last = None
+            t_action = None
 
-    if not in_warmup and teacher is not None and (enable_logit or enable_feature):
-        teacher_batch = {
-            k: v.to(teacher_device) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+            if accelerator.is_main_process and teacher is not None and teacher_batch is not None:
+                t_hook_modules = {}
+                if dc.feature_distill:
+                    t_hook_modules = {
+                        "teacher_vision": teacher.model.vlm.vision_tower,
+                        "teacher_last": teacher.model.transformer.blocks[-1],
+                    }
+                with MultiHookManager(t_hook_modules) as t_hooks, \
+                     torch.no_grad(), \
+                     torch.amp.autocast("cuda", dtype=torch.float16):
+                    t_inputs = teacher._build_model_inputs(teacher_batch)
+                    if dc.feature_distill:
+                        teacher.model.forward_vlm(
+                            input_ids=t_inputs["input_ids"],
+                            pixel_values=t_inputs["image_input"],
+                            image_mask=t_inputs["image_mask"],
+                        )
+                        t_vision = t_hooks["teacher_vision"].output.float()
+                        t_last = t_hooks["teacher_last"].output.float()
+                    if dc.logit_distill:
+                        t_action = teacher.model.generate_actions(
+                            input_ids=t_inputs["input_ids"],
+                            image_input=t_inputs["image_input"],
+                            image_mask=t_inputs["image_mask"],
+                            domain_id=t_inputs["domain_id"],
+                            proprio=t_inputs["proprio"],
+                            steps=teacher.config.num_denoising_steps,
+                        ).float()
 
-        teacher_hook_modules = {}
-        if enable_feature:
-            teacher_hook_modules["teacher_vision"] = teacher.model.vlm.vision_tower
-            teacher_hook_modules["teacher_last"] = teacher.model.transformer.blocks[-1]
+            with MultiHookManager(s_hook_modules) as s_hooks:
+                # 需要学生再次前向以捕获 hook（已经在上方 task loss 计算时前向，
+                # 若特征未被 hook，这里补一次轻量前向）
+                if dc.feature_distill:
+                    with torch.no_grad(), accelerator.autocast():
+                        student.forward(student_batch)
 
-        with MultiHookManager(teacher_hook_modules) as teacher_hooks:
-            with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
-                # 获取教师 VLM 特征
-                teacher_inputs = teacher._build_model_inputs(teacher_batch)
-                enc = teacher.model.forward_vlm(
-                    input_ids=teacher_inputs["input_ids"],
-                    pixel_values=teacher_inputs["image_input"],
-                    image_mask=teacher_inputs["image_mask"],
-                )
-                teacher_vlm_feat = enc["vlm_features"]  # (B, L_t, D_teacher_vlm)
+                # ── 特征蒸馏 ─────────────────────────────────────────────────
+                if dc.feature_distill:
+                    dev = accelerator.device
+                    # 广播教师特征到所有进程
+                    if accelerator.is_main_process:
+                        t_vision = t_vision.to(dev)
+                        t_last = t_last.to(dev)
+                    else:
+                        # 占位张量（形状以学生特征推断，广播后会被覆盖）
+                        sv_shape = s_hooks["student_vision"].output.shape
+                        se_shape = s_hooks["student_last"].output.shape
+                        t_vision = torch.zeros(sv_shape[0], sv_shape[1],
+                                               dc.teacher_vision_dim, device=dev)
+                        t_last = torch.zeros(se_shape[0], se_shape[1],
+                                             dc.teacher_expert_dim, device=dev)
+                    accelerator.broadcast(t_vision, src=0)
+                    accelerator.broadcast(t_last, src=0)
 
-                # 获取教师预测动作
-                if enable_logit:
-                    teacher_pred_action = teacher.model.generate_actions(
-                        input_ids=teacher_inputs["input_ids"],
-                        image_input=teacher_inputs["image_input"],
-                        image_mask=teacher_inputs["image_mask"],
-                        domain_id=teacher_inputs["domain_id"],
-                        proprio=teacher_inputs["proprio"],
-                        steps=teacher.config.num_denoising_steps,
-                    )  # (B, chunk_size, action_dim)
+                    sv = s_hooks["student_vision"].output.float()
+                    sv = align_seq_len(sv, t_vision)
+                    sv_proj = adapters.adapt_vision(sv)
+                    loss_vis = F.mse_loss(sv_proj, t_vision.detach())
+                    distill_loss = distill_loss + dc.alpha_feature * loss_vis
+                    log["loss_vision_feat"] = loss_vis.item()
 
-            # 捕获教师中间层特征
-            if enable_feature:
-                teacher_vision_feat = teacher_hooks["teacher_vision"].output
-                teacher_last_feat = teacher_hooks["teacher_last"].output
+                    se = s_hooks["student_last"].output.float()
+                    se = align_seq_len(se, t_last)
+                    se_proj = adapters.adapt_expert(se)
+                    loss_exp = F.mse_loss(se_proj, t_last.detach())
+                    distill_loss = distill_loss + dc.alpha_feature * loss_exp
+                    log["loss_expert_feat"] = loss_exp.item()
 
-        # 立即释放教师临时特征，清理显存
-        del teacher_inputs
-        torch.cuda.empty_cache()
+                # ── Logit 蒸馏 ───────────────────────────────────────────────
+                if dc.logit_distill and student_pred_action is not None:
+                    dev = accelerator.device
+                    if accelerator.is_main_process:
+                        t_action = t_action.to(dev)
+                    else:
+                        t_action = torch.zeros(
+                            student_pred_action.shape[0],
+                            student_pred_action.shape[1],
+                            dc.teacher_action_dim,
+                            device=dev,
+                        )
+                    accelerator.broadcast(t_action, src=0)
 
-    # -------------------------------------------------------------------
-    # 4. 蒸馏损失
-    # -------------------------------------------------------------------
-    distill_loss = torch.tensor(0.0, device=student_device)
-    log_info = {}
+                    s_act = student_pred_action.float()
+                    t_act = t_action[:, : s_act.shape[1], : dc.teacher_action_dim]
+                    s_act_proj = adapters.adapt_action(s_act)
+                    T = dc.temperature
+                    loss_kl = F.kl_div(
+                        F.log_softmax(s_act_proj / T, dim=-1),
+                        F.softmax(t_act.detach() / T, dim=-1),
+                        reduction="batchmean",
+                    ) * (T ** 2)
+                    distill_loss = distill_loss + dc.alpha_logit * loss_kl
+                    log["loss_kl_action"] = loss_kl.item()
 
-    if not in_warmup:
-        # 4a. 视觉特征蒸馏
-        if enable_feature and teacher_vision_feat is not None:
-            sv = student_hooks["student_vision"].output  # (B, L_s, D_student)
-            tv = teacher_vision_feat.to(student_device).float()  # (B, L_t, D_teacher)
+        # ── 3. 总损失 ────────────────────────────────────────────────────────
+        total_loss = dc.alpha_task * task_loss + dc.alpha_distill * distill_loss
 
-            # 序列长度对齐
-            sv = align_seq_len(sv.float(), tv)
-            # 维度对齐（投影到教师维度）
-            sv_proj = adapters.adapt_vision(sv)
-            loss_vis = F.mse_loss(sv_proj, tv)
-            distill_loss = distill_loss + alpha_feature * loss_vis
-            log_info["loss_vision_feat"] = loss_vis.item()
+        # ── 4. 反向 ─────────────────────────────────────────────────────────
+        accelerator.backward(total_loss)
 
-            # 释放
-            del tv, sv, sv_proj
-            torch.cuda.empty_cache()
+        # ── 5. 梯度裁剪 + 优化器步进 ────────────────────────────────────────
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(
+                list(student.parameters()) + list(adapters.parameters()),
+                grad_clip_norm,
+            )
+        else:
+            grad_norm = torch.tensor(0.0)
 
-        # 4b. Action Expert 最后层特征蒸馏
-        if enable_feature and teacher_last_feat is not None:
-            se = student_hooks["student_last"].output.float()  # (B, L_s, D_student_exp)
-            te = teacher_last_feat.to(student_device).float()    # (B, L_t, D_teacher)
+        optimizer.step()
+        optimizer.zero_grad()
 
-            se = align_seq_len(se, te)
-            se_proj = adapters.adapt_expert(se)
-            loss_expert = F.mse_loss(se_proj, te)
-            distill_loss = distill_loss + alpha_feature * loss_expert
-            log_info["loss_expert_feat"] = loss_expert.item()
+    if lr_scheduler is not None:
+        lr_scheduler.step()
 
-            del te, se, se_proj
-            torch.cuda.empty_cache()
+    log.update({
+        "loss_task": task_loss.item(),
+        "loss_distill": distill_loss.item(),
+        "in_warmup": float(in_warmup),
+    })
 
-        # 4c. 输出层 Logit（动作）KL 散度蒸馏
-        if enable_logit and teacher_pred_action is not None and student_pred_action is not None:
-            t_action = teacher_pred_action.to(student_device).float()  # (B, T_t, D_t)
-            s_action = student_pred_action.float()                     # (B, T_s, D_s)
-
-            # 对齐 chunk 维度
-            T_min = min(t_action.shape[1], s_action.shape[1])
-            t_action = t_action[:, :T_min, :]
-            s_action = s_action[:, :T_min, :]
-
-            # 将学生动作投影到教师动作维度
-            s_action_proj = adapters.adapt_action(s_action)  # (B, T_min, D_t)
-
-            # KL 散度（在动作维度上）
-            T_kl = temperature
-            log_p_s = F.log_softmax(s_action_proj / T_kl, dim=-1)
-            p_t = F.softmax(t_action / T_kl, dim=-1)
-            loss_kl = F.kl_div(log_p_s, p_t, reduction="batchmean") * (T_kl ** 2)
-            distill_loss = distill_loss + alpha_logit * loss_kl
-            log_info["loss_kl_action"] = loss_kl.item()
-
-            del t_action, s_action, s_action_proj
-            torch.cuda.empty_cache()
-
-    # -------------------------------------------------------------------
-    # 5. 总损失
-    # -------------------------------------------------------------------
-    in_warmup_flag = 1.0 if in_warmup else 0.0
-    total_loss = alpha_task * student_task_loss + (1.0 - in_warmup_flag) * alpha_distill * distill_loss
-
-    log_info["loss_task"] = student_task_loss.item()
-    log_info["loss_distill"] = distill_loss.item()
-    log_info["teacher_enabled"] = teacher is not None and not in_warmup
-
-    return total_loss, log_info
+    train_metrics.loss = total_loss.item()
+    train_metrics.grad_norm = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+    train_metrics.lr = optimizer.param_groups[0]["lr"]
+    train_metrics.update_s = time.perf_counter() - t0
+    return train_metrics, log
 
 
 # =============================================================================
-# 检查点管理
+# 主训练函数（对齐 lerobot_train.train）
 # =============================================================================
 
-def save_checkpoint(student: SmolVLAPolicy, step: int, cfg: dict, is_best: bool = False) -> None:
-    """保存学生模型检查点（仅主进程）。"""
-    ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+@parser.wrap()
+def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | None = None):
+    """蒸馏训练主函数，结构对齐 lerobot_train.train。"""
+    cfg.validate()
 
-    save_path = ckpt_dir / f"step_{step:07d}"
-    # 从 DDP 包装中取原始模型
-    model = student.module if isinstance(student, DDP) else student
-    model.save_pretrained(str(save_path))
+    if accelerator is None:
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(
+            step_scheduler_with_optimizer=False,
+            kwargs_handlers=[ddp_kwargs],
+        )
 
-    if is_best:
-        best_path = ckpt_dir / "best"
-        model.save_pretrained(str(best_path))
-
-    # 清理旧检查点（保留最近 N 个 + best）
-    keep_n = cfg["training"].get("keep_last_n_checkpoints", 3)
-    ckpt_dirs = sorted(
-        [p for p in ckpt_dir.iterdir() if p.is_dir() and p.name.startswith("step_")],
-        key=lambda p: int(p.name.split("_")[1]),
-    )
-    while len(ckpt_dirs) > keep_n:
-        oldest = ckpt_dirs.pop(0)
-        import shutil
-        shutil.rmtree(oldest)
-
-
-# =============================================================================
-# 主训练循环
-# =============================================================================
-
-def train(cfg: dict, local_rank: int, rank: int, world_size: int) -> None:
-    """主训练函数。"""
-    is_main = rank == 0
-    log_file = cfg["paths"].get("log_file", "logs/train.log")
-    logger = setup_logging(log_file, rank)
+    init_logging(accelerator=accelerator)
+    is_main = accelerator.is_main_process
 
     if is_main:
-        logger.info("=" * 60)
-        logger.info("VLA 蒸馏训练启动")
-        logger.info(f"教师设备: {cfg['teacher']['device']}")
-        logger.info(f"学生设备数: {world_size}，local_rank={local_rank}")
-        logger.info(f"特征蒸馏: {cfg['distillation']['enable_feature_distill']}")
-        logger.info(f"Logit蒸馏: {cfg['distillation']['enable_logit_distill']}")
-        logger.info("=" * 60)
+        logging.info(pformat(dataclasses.asdict(cfg)))
 
-    validate_paths(cfg, logger)
-    torch.manual_seed(cfg["training"].get("seed", 42) + rank)
+    # WandB（仅主进程）
+    if cfg.wandb.enable and cfg.wandb.project and is_main and WandBLogger is not None and cfg.policy is not None:
+        wandb_logger = WandBLogger(cfg)
+    else:
+        wandb_logger = None
+        if is_main:
+            if cfg.wandb.enable and cfg.policy is None:
+                logging.info(colored("跳过 WandB 初始化：当前 distill 配置未提供 cfg.policy。", "yellow", attrs=["bold"]))
+            else:
+                logging.info(colored("Logs 仅保存本地。", "yellow", attrs=["bold"]))
 
-    student_device = f"cuda:{local_rank}"
-    teacher_device = cfg["teacher"]["device"]
+    if cfg.seed is not None:
+        set_seed(cfg.seed, accelerator=accelerator)
 
-    # 若学生 GPU 有偏移（教师占用 cuda:0 等），重新计算学生设备
-    cuda_offset = cfg["student"].get("cuda_offset", 0)
-    if cuda_offset > 0:
-        student_device = f"cuda:{local_rank + cuda_offset}"
+    if cfg.policy is None:
+        cfg.policy = PreTrainedConfig.from_pretrained(cfg.student_path)
+        cfg.policy.pretrained_path = Path(cfg.student_path)
+        if is_main:
+            logging.info(f"Loaded policy config from student_path: {cfg.student_path}")
 
-    # -------------------------------------------------------------------
-    # 加载模型
-    # -------------------------------------------------------------------
-    teacher = load_teacher(cfg, rank, logger)
-    student = load_student(cfg, local_rank, logger)
+    device = accelerator.device
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
 
-    # 用 DDP 包装学生模型
-    student_ddp = DDP(
-        student,
-        device_ids=[int(student_device.split(":")[-1])],
-        output_device=int(student_device.split(":")[-1]),
-        find_unused_parameters=True,  # SmolVLA 有部分冻结参数
+    # ── 数据集 ───────────────────────────────────────────────────────────────
+    if is_main:
+        logging.info("Creating dataset")
+        dataset = make_dataset(cfg)
+    accelerator.wait_for_everyone()
+    if not is_main:
+        dataset = make_dataset(cfg)
+
+    # ── 学生模型 ─────────────────────────────────────────────────────────────
+    if is_main:
+        logging.info("Loading student policy")
+    student = load_student(cfg)
+
+    # 预处理器
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=student.config,
+        pretrained_path=Path(cfg.student_path),
+        dataset_stats=dataset.meta.stats,
     )
 
-    # -------------------------------------------------------------------
-    # 适配层（在学生设备上）
-    # -------------------------------------------------------------------
-    distill_cfg = cfg["distillation"]
-    adapters = DistillAdapters(
-        student_vision_dim=cfg["student"]["vlm_feat_dim"],
-        teacher_vision_dim=cfg["teacher"]["vlm_feat_dim"],
-        student_expert_dim=cfg["student"]["expert_hidden_size"],
-        teacher_expert_dim=cfg["teacher"]["transformer_hidden_size"],
-        student_action_dim=cfg["student"]["action_dim"],
-        teacher_action_dim=cfg["teacher"]["action_dim"],
-        enable_feature_distill=distill_cfg["enable_feature_distill"],
-        enable_logit_distill=distill_cfg["enable_logit_distill"],
-    ).to(student_device)
+    # ── 教师模型（仅主进程）──────────────────────────────────────────────────
+    accelerator.wait_for_everyone()
+    teacher = load_teacher(cfg, accelerator)
 
-    # -------------------------------------------------------------------
-    # 优化器 & 调度器
-    # -------------------------------------------------------------------
-    train_cfg = cfg["training"]
-    # 学生模型可训练参数 + 适配层参数一起优化
-    optim_params = [
+    # 教师预处理器（主进程）
+    teacher_preprocessor = None
+    if is_main and teacher is not None:
+        teacher_preprocessor, _ = make_pre_post_processors(
+            policy_cfg=teacher.config,
+            pretrained_path=Path(cfg.distill.teacher_path),
+            dataset_stats=dataset.meta.stats,
+        )
+
+    # ── 适配层 ───────────────────────────────────────────────────────────────
+    dc = cfg.distill
+    adapters = DistillAdapters(
+        student_vision_dim=dc.student_vision_dim,
+        teacher_vision_dim=dc.teacher_vision_dim,
+        student_expert_dim=dc.student_expert_dim,
+        teacher_expert_dim=dc.teacher_expert_dim,
+        student_action_dim=dc.student_action_dim,
+        teacher_action_dim=dc.teacher_action_dim,
+        enable_feature_distill=dc.feature_distill,
+        enable_logit_distill=dc.logit_distill,
+    ).to(device)
+
+    # ── 优化器 & 调度器 ──────────────────────────────────────────────────────
+    if is_main:
+        logging.info("Creating optimizer and scheduler")
+
+    all_params = [
         {"params": [p for p in student.parameters() if p.requires_grad]},
         {"params": list(adapters.parameters())},
     ]
-    optimizer = torch.optim.AdamW(
-        optim_params,
-        lr=train_cfg["learning_rate"],
-        betas=tuple(train_cfg.get("optimizer_betas", [0.9, 0.95])),
-        eps=train_cfg.get("optimizer_eps", 1e-8),
-        weight_decay=train_cfg.get("weight_decay", 1e-6),
+
+    # 使用 student policy 自带的 training preset（若存在）
+    if cfg.use_policy_training_preset and hasattr(student, "get_optimizer_preset"):
+        from lerobot.optim.factory import make_optimizer_and_scheduler
+        optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, student)
+        # 追加 adapters 参数组
+        for p in adapters.parameters():
+            optimizer.add_param_group({"params": p})
+    else:
+        import math
+        from torch.optim.lr_scheduler import LambdaLR
+        opt_cfg = cfg.optimizer
+        lr = opt_cfg.lr if opt_cfg else 1e-4
+        wd = opt_cfg.weight_decay if opt_cfg else 1e-6
+        optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=wd)
+
+        warmup = cfg.scheduler.warmup_steps if cfg.scheduler else 1000
+        total = cfg.steps
+
+        def _lr_lambda(s):
+            if s < warmup:
+                return s / max(1, warmup)
+            p = (s - warmup) / max(1, total - warmup)
+            return 0.5 * (1 + math.cos(math.pi * p))
+
+        lr_scheduler = LambdaLR(optimizer, _lr_lambda)
+
+    # ── 断点恢复 ─────────────────────────────────────────────────────────────
+    step = 0
+    if cfg.resume:
+        step, optimizer, lr_scheduler = load_training_state(
+            cfg.checkpoint_path, optimizer, lr_scheduler
+        )
+
+    num_learnable = sum(p.numel() for p in student.parameters() if p.requires_grad)
+    num_total = sum(p.numel() for p in student.parameters())
+    if is_main:
+        logging.info(colored(f"Output dir: {cfg.output_dir}", "yellow", attrs=["bold"]))
+        logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
+        logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
+        logging.info(f"{dataset.num_episodes=}")
+        effective_bs = cfg.batch_size * accelerator.num_processes
+        logging.info(f"Effective batch size: {cfg.batch_size} x {accelerator.num_processes} = {effective_bs}")
+        logging.info(f"{num_learnable=} ({format_big_number(num_learnable)})")
+        logging.info(f"{num_total=} ({format_big_number(num_total)})")
+
+    # ── DataLoader ───────────────────────────────────────────────────────────
+    if hasattr(student.config, "drop_n_last_frames"):
+        sampler = EpisodeAwareSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            episode_indices_to_use=dataset.episodes,
+            drop_n_last_frames=student.config.drop_n_last_frames,
+            shuffle=True,
+        )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        num_workers=cfg.num_workers,
+        batch_size=cfg.batch_size,
+        shuffle=shuffle and not cfg.dataset.streaming,
+        sampler=sampler,
+        pin_memory=device.type == "cuda",
+        drop_last=False,
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
-    total_steps = train_cfg["total_steps"]
-    warmup_steps_sched = train_cfg.get("scheduler_warmup_steps", 1000)
-    decay_steps = train_cfg.get("scheduler_decay_steps", 25000)
-    decay_lr = train_cfg.get("scheduler_decay_lr", 2.5e-6)
+    # ── Accelerator prepare ──────────────────────────────────────────────────
+    accelerator.wait_for_everyone()
+    student, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        student, optimizer, dataloader, lr_scheduler
+    )
+    adapters = accelerator.prepare(adapters)
+    dl_iter = cycle(dataloader)
 
-    def lr_lambda(current_step: int) -> float:
-        """余弦衰减 + 线性预热。"""
-        base_lr = train_cfg["learning_rate"]
-        if current_step < warmup_steps_sched:
-            return float(current_step) / max(1, warmup_steps_sched)
-        progress = (current_step - warmup_steps_sched) / max(1, decay_steps - warmup_steps_sched)
-        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-        return max(decay_lr / base_lr, cosine_factor)
+    # ── 指标跟踪 ─────────────────────────────────────────────────────────────
+    train_metrics = {
+        "loss": AverageMeter("loss", ":.4f"),
+        "grad_norm": AverageMeter("grdn", ":.3f"),
+        "lr": AverageMeter("lr", ":0.1e"),
+        "update_s": AverageMeter("updt_s", ":.3f"),
+        "dataloading_s": AverageMeter("data_s", ":.3f"),
+    }
+    train_tracker = MetricsTracker(
+        cfg.batch_size,
+        dataset.num_frames,
+        dataset.num_episodes,
+        train_metrics,
+        initial_step=step,
+        accelerator=accelerator,
+    )
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # 混合精度
-    scaler = torch.amp.GradScaler("cuda")
-
-    # -------------------------------------------------------------------
-    # 数据集
-    # -------------------------------------------------------------------
-    loader, sampler = build_dataloader(cfg, rank, world_size)
-
-    # -------------------------------------------------------------------
-    # W&B（仅主进程）
-    # -------------------------------------------------------------------
-    wandb_run = None
-    if is_main and cfg.get("wandb", {}).get("enabled", False):
-        try:
-            import wandb
-            wb_cfg = cfg["wandb"]
-            os.makedirs(wb_cfg.get("log_dir", "logs/wandb"), exist_ok=True)
-            wandb_run = wandb.init(
-                project=wb_cfg.get("project", "vla_distillation"),
-                name=wb_cfg.get("run_name", "smolvla_from_xvla"),
-                dir=wb_cfg.get("log_dir", "logs/wandb"),
-                config=cfg,
+    if is_main:
+        progbar = tqdm(
+            total=cfg.steps - step,
+            desc="Distill Training",
+            unit="step",
+            disable=inside_slurm(),
+            position=0,
+            leave=True,
+        )
+        logging.info(
+            colored(
+                f"开始蒸馏训练，共 {cfg.steps} 步，"
+                f"feature_distill={dc.feature_distill}，"
+                f"logit_distill={dc.logit_distill}",
+                "green",
+                attrs=["bold"],
             )
-            logger.info("W&B 已启用")
-        except Exception as e:
-            logger.warning(f"W&B 初始化失败: {e}，跳过")
+        )
 
-    # -------------------------------------------------------------------
-    # 训练循环
-    # -------------------------------------------------------------------
-    accum_steps = train_cfg.get("accum_steps", 1)
-    log_every = train_cfg.get("log_every_steps", 50)
-    save_every = train_cfg.get("save_every_steps", 2000)
-    grad_clip = train_cfg.get("grad_clip_norm", 10.0)
+    # ── 训练主循环 ───────────────────────────────────────────────────────────
+    for _ in range(step, cfg.steps):
+        t_data = time.perf_counter()
+        raw_batch = next(dl_iter)
+        student_batch = preprocessor(raw_batch)
+        teacher_batch = teacher_preprocessor(raw_batch) if (is_main and teacher_preprocessor) else None
+        train_tracker.dataloading_s = time.perf_counter() - t_data
 
-    step = 0
-    best_loss = float("inf")
-    data_iter = iter(loader)
-
-    optimizer.zero_grad()
-    t_start = time.time()
-
-    while step < total_steps:
-        sampler.set_epoch(step // len(loader) if len(loader) > 0 else 0)
-
-        # 从迭代器取一个 batch
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            batch = next(data_iter)
-
-        # 梯度累积内循环
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
-            loss, log_info = compute_distill_loss(
-                student=student_ddp,
-                teacher=teacher,
-                batch=batch,
-                adapters=adapters,
-                cfg=cfg,
-                teacher_device=teacher_device,
-                student_device=student_device,
-                step=step,
-                logger=logger,
-            )
-            loss = loss / accum_steps
-
-        scaler.scale(loss).backward()
-
-        # 梯度累积：每 accum_steps 步更新一次
-        if (step + 1) % accum_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in student.parameters() if p.requires_grad]
-                + list(adapters.parameters()),
-                grad_clip,
-            )
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
+        train_tracker, output_dict = update_distill(
+            train_metrics=train_tracker,
+            student=student,
+            teacher=teacher,
+            student_batch=student_batch,
+            teacher_batch=teacher_batch,
+            adapters=adapters,
+            optimizer=optimizer,
+            grad_clip_norm=cfg.optimizer.grad_clip_norm if cfg.optimizer else 10.0,
+            step=step,
+            cfg=cfg,
+            accelerator=accelerator,
+            lr_scheduler=lr_scheduler,
+        )
 
         step += 1
+        if is_main:
+            progbar.update(1)
+        train_tracker.step()
 
-        # -------------------------------------------------------------------
+        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main
+        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+
         # 日志
-        # -------------------------------------------------------------------
-        if is_main and step % log_every == 0:
-            elapsed = time.time() - t_start
-            lr_now = optimizer.param_groups[0]["lr"]
-            mem_used = torch.cuda.max_memory_allocated(student_device) / 1024 ** 3
-            logger.info(
-                f"step={step}/{total_steps} | "
-                f"loss={log_info['loss_total']:.4f} "
-                f"(task={log_info['loss_task']:.4f} distill={log_info['loss_distill']:.4f}) | "
-                f"lr={lr_now:.2e} | mem={mem_used:.2f}GB | "
-                f"elapsed={elapsed:.0f}s | warmup={log_info['in_warmup']}"
-            )
-            if wandb_run:
-                wandb_run.log(
-                    {
-                        "step": step,
-                        "loss/total": log_info["loss_total"],
-                        "loss/task": log_info["loss_task"],
-                        "loss/distill": log_info["loss_distill"],
-                        **{f"loss/{k}": v for k, v in log_info.items() if k.startswith("loss_") and k not in ("loss_task", "loss_distill", "loss_total")},
-                        "lr": lr_now,
-                        "gpu_mem_gb": mem_used,
-                    }
+        if is_log_step:
+            logging.info(train_tracker)
+            if wandb_logger:
+                wandb_log = train_tracker.to_dict()
+                if output_dict:
+                    wandb_log.update({f"distill/{k}": v for k, v in output_dict.items()})
+                wandb_logger.log_dict(wandb_log, step)
+            train_tracker.reset_averages()
+
+        # 保存检查点
+        if cfg.save_checkpoint and is_saving_step:
+            if is_main:
+                logging.info(f"Checkpoint after step {step}")
+                ckpt_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                save_checkpoint(
+                    checkpoint_dir=ckpt_dir,
+                    step=step,
+                    cfg=cfg,
+                    policy=accelerator.unwrap_model(student),
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
                 )
+                # 额外保存 adapters 权重（与学生 checkpoint 同目录）
+                adapters_path = ckpt_dir / "adapters.pt"
+                torch.save(accelerator.unwrap_model(adapters).state_dict(), adapters_path)
+                update_last_checkpoint(ckpt_dir)
+                if wandb_logger:
+                    wandb_logger.log_policy(ckpt_dir)
+            accelerator.wait_for_everyone()
 
-        # -------------------------------------------------------------------
-        # 检查点
-        # -------------------------------------------------------------------
-        if is_main and step % save_every == 0:
-            cur_loss = log_info["loss_total"]
-            is_best = cur_loss < best_loss
-            if is_best:
-                best_loss = cur_loss
-            save_checkpoint(student_ddp, step, cfg, is_best=is_best)
-            logger.info(f"已保存检查点 step={step}，is_best={is_best}")
-
-    # 训练结束保存最终检查点
+    # ── 收尾 ─────────────────────────────────────────────────────────────────
     if is_main:
-        save_checkpoint(student_ddp, step, cfg, is_best=False)
-        logger.info(f"训练完成！共 {step} 步，最终检查点已保存。")
-        if wandb_run:
-            wandb_run.finish()
+        progbar.close()
+        logging.info("蒸馏训练完成。")
 
-    cleanup_ddp()
+    accelerator.wait_for_everyone()
+    accelerator.end_training()
 
 
 # =============================================================================
@@ -723,16 +657,8 @@ def train(cfg: dict, local_rank: int, rank: int, world_size: int) -> None:
 # =============================================================================
 
 def main():
-    args = parse_args()
-    cfg = load_config(args.config)
-    cfg = apply_cli_overrides(cfg, args)
-
-    # 初始化 DDP
-    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
-    student_cuda_offset = cfg.get("student", {}).get("cuda_offset", 0)
-    rank, world_size = setup_ddp(local_rank, student_cuda_offset)
-
-    train(cfg, local_rank, rank, world_size)
+    register_third_party_plugins()
+    train_distill()
 
 
 if __name__ == "__main__":
