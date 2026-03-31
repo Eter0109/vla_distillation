@@ -1,0 +1,139 @@
+# 蒸馏实验配置文件 - libero数据集 SmolVLA <- XVLA
+
+# ============================================================
+# 数据集配置
+# ============================================================
+dataset:
+  path: /hqlab/workspace/zhaozy/datasets/libero   # 本地libero数据集根目录
+  repo_id: lerobot/libero_spatial                  # 数据集标识（本地优先）
+  image_keys:
+    - observation.images.image
+    - observation.images.image2
+  state_key: observation.state
+  action_key: action
+
+# ============================================================
+# 教师模型配置（XVLA，单卡推理，禁止DataParallel）
+# ============================================================
+teacher:
+  path: /hqlab/workspace/zhaozy/models/xvla-libero-model
+  device: cuda:1            # 教师模型部署卡（可被 --teacher_device 覆盖）
+  dtype: float16            # 半精度推理（torch.cuda.amp.autocast）
+  # 教师模型action维度（根据模型config.json）
+  action_dim: 20
+  chunk_size: 30
+  # 教师VLM特征维度（Florence2 projection_dim）
+  vlm_feat_dim: 1024        # forward_vlm输出 enc_out 的 hidden_dim
+  # 教师action transformer hidden_size
+  transformer_hidden_size: 1024
+
+# ============================================================
+# 学生模型配置（SmolVLA，多卡DDP）
+# ============================================================
+student:
+  path: /hqlab/workspace/zhaozy/models/smolvla_libero
+  devices: [2, 3, 4, 5]    # 学生训练卡列表（可被 --student_devices 覆盖）
+  # 学生VLM SigLIP视觉特征维度（SmolVLM2-500M vision_model输出）
+  # SmolVLM2-500M SigLIP: hidden_size=1152，但embed_image输出经过投影
+  # 实际image_emb_dim需要运行时确认，此处填写text_config.hidden_size=576
+  vlm_feat_dim: 576         # embed_image输出的最后一维
+  # 学生action expert hidden_size = 576 * expert_width_multiplier(0.5)
+  expert_hidden_size: 288
+  action_dim: 7             # 真实动作维度（根据smolvla config.json output_features）
+  chunk_size: 50
+  # 是否启用梯度检查点（节省显存，略微降低速度）
+  use_gradient_checkpointing: true
+
+# ============================================================
+# 蒸馏损失配置
+# ============================================================
+distillation:
+  # 损失权重
+  alpha_task: 1.0           # 学生与真实动作的MSE权重
+  alpha_distill: 0.5        # 蒸馏损失总权重（可命令行覆盖 --alpha）
+
+  # 蒸馏损失各分项权重（仅在对应开关打开时生效）
+  alpha_logit: 0.6          # 输出层KL散度权重（动作logit蒸馏）
+  alpha_feature: 0.4        # 中间特征MSE蒸馏权重
+
+  # 蒸馏方式开关
+  enable_logit_distill: true    # 是否启用输出层logit（动作）KL散度蒸馏
+  enable_feature_distill: true  # 是否启用多层中间特征蒸馏
+
+  # 多层特征蒸馏：指定要对齐的层
+  # 教师模型使用model.transformer（SoftPromptedTransformer）
+  # 学生模型使用model.vlm_with_expert.lm_expert（SmolLM action expert）
+  teacher_feature_layers:
+    - vision    # 教师VLM视觉特征（forward_vlm输出vlm_features）
+    - last      # 教师transformer最后一层输出
+  student_feature_layers:
+    - vision    # 学生VLM视觉特征（embed_image输出）
+    - last      # 学生lm_expert最后一层输出
+
+  # 预热阶段：前N步仅用任务损失，不做蒸馏
+  warmup_steps: 500
+
+  # KL散度温度（数值越大越软）
+  temperature: 2.0
+
+# ============================================================
+# 训练超参
+# ============================================================
+training:
+  total_steps: 30000         # 总训练步数
+  batch_size: 8              # 每卡batch size（总bs = batch_size * num_student_gpus）
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  grad_clip_norm: 10.0
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-8
+
+  # 梯度累积步数（有效bs = batch_size * num_gpus * accum_steps）
+  accum_steps: 4
+
+  # 学习率调度
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 25000
+  scheduler_decay_lr: 2.5e-6
+
+  # 检查点
+  save_every_steps: 2000       # 每N步保存一次
+  keep_last_n_checkpoints: 3   # 保留最近N个检查点
+
+  # 日志
+  log_every_steps: 50         # 每N步打印一次日志
+
+  # 随机种子
+  seed: 42
+
+# ============================================================
+# 数据加载
+# ============================================================
+dataloader:
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  # delta_timestamps（相对于当前帧的时间偏移，单位秒，采样率1/fps）
+  delta_timestamps:
+    observation.images.image: [0.0]
+    observation.images.image2: [0.0]
+    observation.state: [0.0]
+    action: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]  # 8步动作chunk，需与 fps=10 对齐
+
+# ============================================================
+# 路径配置
+# ============================================================
+paths:
+  output_dir: /hqlab/workspace/zhaozy/vla_distillation/outputs
+  checkpoint_dir: /hqlab/workspace/zhaozy/vla_distillation/outputs/checkpoints
+  log_dir: /hqlab/workspace/zhaozy/vla_distillation/logs
+  log_file: /hqlab/workspace/zhaozy/vla_distillation/logs/train.log
+
+# ============================================================
+# W&B配置
+# ============================================================
+wandb:
+  enabled: true             # 是否启用wandb（需要提前 wandb login）
+  project: vla_distillation
+  run_name: smolvla_from_xvla
+  log_dir: /hqlab/workspace/zhaozy/vla_distillation/logs/wandb
