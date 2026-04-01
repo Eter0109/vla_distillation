@@ -59,34 +59,33 @@ This project distills XVLA (teacher, Florence2-based VLA) into SmolVLA (student,
 | `EpisodeAwareSampler` + `cycle` | identical |
 
 ### Hardware layout
-- Teacher (XVLA): `cuda:1` — frozen fp16, never wrapped in DDP, only loaded on main process
+- Teacher (XVLA): `accelerator.device` per rank — frozen fp16, loaded on every rank independently (no DDP)
 - Student (SmolVLA): `cuda:2,3,4,5` — 4-GPU DDP via `accelerator.prepare`, mixed precision
 
 ### Training data flow per step
-1. `next(dl_iter)` → `preprocessor(batch)` for student; `teacher_preprocessor(batch)` on main process only
-2. Student forward → task loss (`student.forward(batch)`)
-3. Teacher forward (main process only, `no_grad`, `fp16 autocast`) with `MultiHookManager` capturing intermediate features
-4. `accelerator.broadcast(teacher_feat, src=0)` — synchronizes teacher features to all DDP ranks
-5. Compute feature MSE (via `DistillAdapters`) + logit KL divergence
-6. `accelerator.backward(total_loss)` → grad clip → optimizer step
+1. `next(dl_iter)` → `preprocessor(batch)` for student; `teacher_preprocessor(batch)` on every rank
+2. Student forward → task loss (`student.forward(batch)`); hooks capture `student_vision` from `connector`
+3. Teacher forward (`no_grad`, `fp16 autocast`) — `forward_vlm()` returns `vlm_features` directly; `MultiHookManager` captures `teacher_last` from `transformer.blocks[-1]`; student expert features read from `vlm_with_expert._last_expert_output` (cached attribute set during student forward)
+4. Compute feature MSE (via `DistillAdapters`) + logit KL divergence
+5. `accelerator.backward(total_loss)` → grad clip → optimizer step
 
 ### Loss formula
 ```
 total_loss = alpha_task × task_loss
            + alpha_distill × (alpha_feature × feat_loss + alpha_logit × kl_loss)
 ```
-During warmup (default first 500 steps), only task loss is active.
+During warmup (`warmup_steps`, set to `0` in `distill_config.yaml` / `500` in `DistillConfig` dataclass), only task loss is active.
 
 ### Feature alignment (`src/adapters.py`)
 Trainable projections (Linear + LayerNorm) map student → teacher feature space. Optimized jointly with the student via a shared `AdamW` optimizer that holds both `student.parameters()` and `adapters.parameters()`.
 
 | Adapter | Student dim | Teacher dim |
 |---------|-------------|-------------|
-| `VisionFeatureAdapter` | 576 (SigLIP) | 1024 (Florence2) |
-| `ActionExpertFeatureAdapter` | 288 (lm_expert hidden) | 1024 (transformer hidden) |
-| `ActionAdapter` | 7 (action_dim) | 20 (action_dim) |
+| `VisionFeatureAdapter` | `student_vision_dim` (default 960, connector output) | `teacher_vision_dim` (default 1024) |
+| `ActionExpertFeatureAdapter` | `student_expert_dim` (default 480, `_last_expert_output`) | `teacher_expert_dim` (default 1024) |
+| `ActionAdapter` | `student_action_dim` (default 7) | `teacher_action_dim` (default 20) |
 
-When `in_dim == out_dim`, the adapter is `nn.Identity` (no extra parameters).
+Dims are driven by `distill_config.yaml` fields and passed to `DistillAdapters(...)`. When `in_dim == out_dim`, the adapter is `nn.Identity` (no extra parameters).
 
 Sequence length mismatch between student and teacher tokens is handled by `align_seq_len(student_feat, teacher_feat)` in `adapters.py` — truncates or zero-pads to match teacher length.
 
@@ -99,13 +98,13 @@ with MultiHookManager({"key": module}) as hooks:
     feat = hooks["key"].output
 ```
 
-Hook attachment points:
-| Key | Module path |
+Hook attachment points (only two active hooks; the other two features are captured differently):
+| Key | How captured |
 |-----|-------------|
-| `student_vision` | `student.model.vlm_with_expert.vlm.model.vision_model` |
-| `student_last` | `student.model.vlm_with_expert.lm_expert.layers[-1]` |
-| `teacher_vision` | `teacher.model.vlm.vision_tower` |
-| `teacher_last` | `teacher.model.transformer.blocks[-1]` |
+| `student_vision` | Hook on `student.model.vlm_with_expert.vlm.model.connector` |
+| `student_last` | Read from `student.model.vlm_with_expert._last_expert_output` (cached attr set during student forward, no hook) |
+| `teacher_vision` | `enc["vlm_features"]` returned directly by `teacher.model.forward_vlm(...)` (no hook) |
+| `teacher_last` | Hook on `teacher.model.transformer.blocks[-1]` |
 
 If XVLA uses `.layers` instead of `.blocks`, update the teacher hook in `src/distill.py` `update_distill()`.
 
