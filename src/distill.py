@@ -252,26 +252,28 @@ def update_distill(
                     vlm_with_expert = student_model.model.vlm_with_expert
                     se_cached = vlm_with_expert._last_expert_output
                     sv = s_hooks["student_vision"].output.float()
-                    if step == 0:
-                        print(
-                            f"[rank{accelerator.process_index}] DEBUG feature shapes: "
+                    if step == 0 and accelerator.is_main_process:
+                        logging.info(
+                            f"[DEBUG] feature shapes: "
                             f"student_vision={tuple(sv.shape)} teacher_vision={tuple(t_vision.shape) if t_vision is not None else None} "
                             f"student_expert={tuple(se_cached.shape) if se_cached is not None else None} "
-                            f"teacher_last={tuple(t_last.shape) if t_last is not None else None}",
-                            flush=True,
+                            f"teacher_last={tuple(t_last.shape) if t_last is not None else None}"
                         )
-                    sv = align_seq_len(sv, t_vision)
-                    sv_proj = adapters.adapt_vision(sv)
-                    loss_vis = F.mse_loss(sv_proj, t_vision.detach())
-                    distill_loss = distill_loss + dc.alpha_feature * loss_vis
-                    log["loss_vision_feat"] = loss_vis.item()
+                    if t_vision is None or se_cached is None:
+                        logging.warning("feature_distill=True 但 t_vision 或 se_cached 为 None，跳过特征蒸馏本步")
+                    else:
+                        sv = align_seq_len(sv, t_vision)
+                        sv_proj = adapters.adapt_vision(sv)
+                        loss_vis = F.mse_loss(sv_proj, t_vision.detach())
+                        distill_loss = distill_loss + dc.alpha_feature * loss_vis
+                        log["loss_vision_feat"] = loss_vis.item()
 
-                    se = se_cached.to(dev).float()
-                    se = align_seq_len(se, t_last)
-                    se_proj = adapters.adapt_expert(se)
-                    loss_exp = F.mse_loss(se_proj, t_last.detach())
-                    distill_loss = distill_loss + dc.alpha_feature * loss_exp
-                    log["loss_expert_feat"] = loss_exp.item()
+                        se = se_cached.to(dev).float()
+                        se = align_seq_len(se, t_last)
+                        se_proj = adapters.adapt_expert(se)
+                        loss_exp = F.mse_loss(se_proj, t_last.detach())
+                        distill_loss = distill_loss + dc.alpha_feature * loss_exp
+                        log["loss_expert_feat"] = loss_exp.item()
 
                 if dc.logit_distill:
                     with torch.no_grad(), accelerator.autocast():
@@ -283,11 +285,10 @@ def update_distill(
                             images, img_masks, lang_tokens, lang_masks, state
                         ).detach()
                         student_pred_action = student_pred_action[..., : dc.student_action_dim]
-                        if step == 0:
-                            print(
-                                f"[rank{accelerator.process_index}] DEBUG action shapes: "
-                                f"student_action={tuple(student_pred_action.shape)} teacher_action={tuple(t_action.shape) if t_action is not None else None}",
-                                flush=True,
+                        if step == 0 and accelerator.is_main_process:
+                            logging.info(
+                                f"[DEBUG] action shapes: "
+                                f"student_action={tuple(student_pred_action.shape)} teacher_action={tuple(t_action.shape) if t_action is not None else None}"
                             )
 
                     s_act = student_pred_action.float()
@@ -352,6 +353,7 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
+            gradient_accumulation_steps=cfg.grad_accum_steps,
         )
 
     init_logging(accelerator=accelerator)
@@ -468,6 +470,12 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         step, optimizer, lr_scheduler = load_training_state(
             cfg.checkpoint_path, optimizer, lr_scheduler
         )
+        adapters_ckpt = Path(cfg.checkpoint_path) / "adapters.pt"
+        if adapters_ckpt.exists():
+            adapters.load_state_dict(torch.load(adapters_ckpt, map_location="cpu"))
+            logging.info(colored(f"已从 {adapters_ckpt} 恢复 adapters 权重", "green"))
+        else:
+            logging.warning(f"resume=True 但未找到 {adapters_ckpt}，adapters 将从头初始化")
 
     num_learnable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     num_total = sum(p.numel() for p in student.parameters())

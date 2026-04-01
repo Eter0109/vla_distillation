@@ -42,11 +42,11 @@ class VisionFeatureAdapter(FeatureProjector):
     将学生模型视觉 connector 输出对齐到教师 `forward_vlm()` 返回的 `vlm_features` 维度。
 
     维度说明：
-        学生（SmolVLA connector 输出）：768维
-        教师（XVLA forward_vlm 返回 vlm_features）：2048维
+        学生（SmolVLA connector 输出）：960维
+        教师（XVLA forward_vlm 返回 vlm_features）：1024维
     """
 
-    def __init__(self, student_dim: int = 768, teacher_dim: int = 2048):
+    def __init__(self, student_dim: int = 960, teacher_dim: int = 1024):
         super().__init__(in_dim=student_dim, out_dim=teacher_dim)
 
 
@@ -90,9 +90,9 @@ class DistillAdapters(nn.Module):
 
     def __init__(
         self,
-        student_vision_dim: int = 576,
+        student_vision_dim: int = 960,
         teacher_vision_dim: int = 1024,
-        student_expert_dim: int = 288,
+        student_expert_dim: int = 480,
         teacher_expert_dim: int = 1024,
         student_action_dim: int = 7,
         teacher_action_dim: int = 20,
