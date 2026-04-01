@@ -360,17 +360,6 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
     if is_main:
         logging.info(pformat(dataclasses.asdict(cfg)))
 
-    # WandB（仅主进程）
-    if cfg.wandb.enable and cfg.wandb.project and is_main and WandBLogger is not None and cfg.policy is not None:
-        wandb_logger = WandBLogger(cfg)
-    else:
-        wandb_logger = None
-        if is_main:
-            if cfg.wandb.enable and cfg.policy is None:
-                logging.info(colored("跳过 WandB 初始化：当前 distill 配置未提供 cfg.policy。", "yellow", attrs=["bold"]))
-            else:
-                logging.info(colored("Logs 仅保存本地。", "yellow", attrs=["bold"]))
-
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
 
@@ -379,6 +368,14 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         cfg.policy.pretrained_path = Path(cfg.student_path)
         if is_main:
             logging.info(f"Loaded policy config from student_path: {cfg.student_path}")
+
+    # WandB（仅主进程）
+    if cfg.wandb.enable and cfg.wandb.project and is_main and WandBLogger is not None and cfg.policy is not None:
+        wandb_logger = WandBLogger(cfg)
+    else:
+        wandb_logger = None
+        if is_main:
+            logging.info(colored("Logs 仅保存本地。", "yellow", attrs=["bold"]))
 
     device = accelerator.device
     torch.backends.cudnn.benchmark = True
