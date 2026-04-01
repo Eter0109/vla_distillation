@@ -1,0 +1,7 @@
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 不跟踪 outputs 文件夹
+/outputs

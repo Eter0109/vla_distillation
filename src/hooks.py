@@ -31,8 +31,18 @@ class FeatureHook:
         # 若输出为 tuple，取第一个元素（通常为隐层状态）
         if isinstance(output, tuple):
             self.output = output[0].detach().clone()
-        else:
+        elif isinstance(output, torch.Tensor):
             self.output = output.detach().clone()
+        else:
+            # HuggingFace ModelOutput (dataclass)：取 last_hidden_state 或第一个 Tensor 字段
+            tensor = getattr(output, "last_hidden_state", None)
+            if tensor is None:
+                # 遍历字段取第一个 Tensor
+                for v in output.values():
+                    if isinstance(v, torch.Tensor):
+                        tensor = v
+                        break
+            self.output = tensor.detach().clone() if tensor is not None else None
 
     def close(self) -> None:
         """移除钩子，释放资源。"""

@@ -39,27 +39,27 @@ class FeatureProjector(nn.Module):
 
 class VisionFeatureAdapter(FeatureProjector):
     """视觉特征适配层。
-    将学生模型 VLM 视觉编码器的输出维度对齐到教师模型 VLM 的维度。
+    将学生模型视觉 connector 输出对齐到教师 `forward_vlm()` 返回的 `vlm_features` 维度。
 
     维度说明：
-        学生（SmolVLM2-500M embed_image输出）：576维（text_config.hidden_size）
-        教师（Florence2 forward_vlm vlm_features）：1024维（projection_dim/hidden_size）
+        学生（SmolVLA connector 输出）：768维
+        教师（XVLA forward_vlm 返回 vlm_features）：2048维
     """
 
-    def __init__(self, student_dim: int = 576, teacher_dim: int = 1024):
+    def __init__(self, student_dim: int = 768, teacher_dim: int = 2048):
         super().__init__(in_dim=student_dim, out_dim=teacher_dim)
 
 
 class ActionExpertFeatureAdapter(FeatureProjector):
     """Action Expert 特征适配层。
-    将学生模型 lm_expert 最后一层输出维度对齐到教师 transformer 隐层维度。
+    将学生模型 lm_expert 最终输出维度对齐到教师 transformer block hidden 维度。
 
     维度说明：
-        学生（SmolVLA expert_hidden_size = 576 * 0.5 = 288）
-        教师（XVLA SoftPromptedTransformer hidden_size = 1024）
+        学生（SmolVLA _last_expert_output）：480维
+        教师（XVLA transformer hidden）：1024维
     """
 
-    def __init__(self, student_dim: int = 288, teacher_dim: int = 1024):
+    def __init__(self, student_dim: int = 480, teacher_dim: int = 1024):
         super().__init__(in_dim=student_dim, out_dim=teacher_dim)
 
 

@@ -4,14 +4,14 @@
 # ============================================================
 
 # ── 训练循环（对应 TrainPipelineConfig 顶层字段）────────────
-batch_size: 1
-steps: 50
+batch_size: 2
+steps: 1000
 log_freq: 50
-save_freq: 2000
+save_freq: 200
 num_workers: 4
 seed: 42
 save_checkpoint: true
-grad_accum_steps: 1        # 梯度累积（DistillTrainPipelineConfig 扩展字段）
+grad_accum_steps: 16        # 梯度累积（DistillTrainPipelineConfig 扩展字段）
 student_path: /hqlab/workspace/zhaozy/models/smolvla_libero
 
 # ── 数据集（DatasetConfig）──────────────────────────────────
@@ -34,16 +34,16 @@ distill:
   feature_distill: true
   logit_distill: true
   # 预热步数（前 N 步只用 task loss）
-  warmup_steps: 500
+  warmup_steps: 0
   temperature: 2.0
   # 教师模型
   teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model
   teacher_device: cuda:1
   teacher_dtype: float16
   # 适配层维度
-  student_vision_dim: 576
+  student_vision_dim: 960
   teacher_vision_dim: 1024
-  student_expert_dim: 288
+  student_expert_dim: 480
   teacher_expert_dim: 1024
   student_action_dim: 7
   teacher_action_dim: 20

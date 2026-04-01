@@ -66,6 +66,7 @@ from lerobot.utils.utils import (
 # 自定义蒸馏模块
 from adapters import DistillAdapters, align_seq_len
 from hooks import MultiHookManager
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 
 # =============================================================================
@@ -88,12 +89,12 @@ class DistillConfig:
     temperature: float = 2.0
     # 教师模型
     teacher_path: str = ""
-    teacher_device: str = "cuda:1"
+    teacher_device: str = "cuda:0"
     teacher_dtype: str = "float16"
     # 适配层维度
-    student_vision_dim: int = 576
+    student_vision_dim: int = 960
     teacher_vision_dim: int = 1024
-    student_expert_dim: int = 288
+    student_expert_dim: int = 480
     teacher_expert_dim: int = 1024
     student_action_dim: int = 7
     teacher_action_dim: int = 20
@@ -130,22 +131,19 @@ class DistillTrainPipelineConfig(TrainPipelineConfig):
 # =============================================================================
 
 def load_teacher(cfg: DistillTrainPipelineConfig, accelerator: Accelerator) -> PreTrainedPolicy | None:
-    """加载教师模型（仅主进程），fp16 冻结部署在 teacher_device。"""
-    if not accelerator.is_main_process:
-        return None
-
+    """加载教师模型（各 rank 本地加载），fp16 冻结部署在当前 rank device。"""
     dc = cfg.distill
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     teacher_dtype = dtype_map[dc.teacher_dtype.lower()]
 
-    logging.info(colored(f"加载教师模型: {dc.teacher_path}", "blue"))
+    logging.info(colored(f"加载教师模型: {dc.teacher_path} -> {accelerator.device}", "blue"))
     teacher_cls = get_policy_class("xvla")
     teacher = teacher_cls.from_pretrained(dc.teacher_path)
-    teacher = teacher.to(device=dc.teacher_device, dtype=teacher_dtype)
+    teacher = teacher.to(device=accelerator.device, dtype=teacher_dtype)
     for p in teacher.parameters():
         p.requires_grad = False
     teacher.eval()
-    logging.info(colored(f"教师模型已就绪: {dc.teacher_device} ({teacher_dtype})", "green"))
+    logging.info(colored(f"教师模型已就绪: {accelerator.device} ({teacher_dtype})", "green"))
     return teacher
 
 
@@ -200,126 +198,102 @@ def update_distill(
 
     student.train()
 
+    student_vision_module = None
+    student_model = student.module if hasattr(student, "module") else student
+    if dc.feature_distill:
+        student_vision_module = student_model.model.vlm_with_expert.vlm.model.connector
+
     with accelerator.accumulate(student, adapters):
-        # ── 1. 学生任务损失 ──────────────────────────────────────────────────
-        with accelerator.autocast():
-            task_loss, student_out = student.forward(student_batch)
-            task_loss = task_loss.float()
+        with MultiHookManager({"student_vision": student_vision_module} if student_vision_module else {}) as s_hooks:
+            # ── 1. 学生任务损失（同时捕获 student features）──────────────────────
+            with accelerator.autocast():
+                task_loss, student_out = student.forward(student_batch)
+                task_loss = task_loss.float()
 
-        # ── 2. 蒸馏损失 ─────────────────────────────────────────────────────
-        distill_loss = torch.zeros(1, device=accelerator.device)
+            # ── 2. 蒸馏损失 ─────────────────────────────────────────────────
+            distill_loss = torch.zeros(1, device=accelerator.device)
 
-        if not in_warmup and (dc.feature_distill or dc.logit_distill):
-            # 学生预测动作（logit distill 用）
-            student_pred_action = None
-            if dc.logit_distill:
-                with torch.no_grad(), accelerator.autocast():
-                    images, img_masks = student.prepare_images(student_batch)
-                    state = student.prepare_state(student_batch)
-                    lang_tokens = student_batch["obs.language_tokens"]
-                    lang_masks = student_batch["obs.language_attention_mask"]
-                    student_pred_action = student.model.sample_actions(
-                        images, img_masks, lang_tokens, lang_masks, state
-                    ).detach()
-                    student_pred_action = student_pred_action[..., : dc.student_action_dim]
+            if not in_warmup and (dc.feature_distill or dc.logit_distill):
+                t_vision = None
+                t_last = None
+                t_action = None
 
-            # 学生 hook 模块
-            s_hook_modules = {}
-            if dc.feature_distill:
-                s_hook_modules = {
-                    "student_vision": student.model.vlm_with_expert.vlm.model.vision_model,
-                    "student_last": student.model.vlm_with_expert.lm_expert.layers[-1],
-                }
-
-            # 教师推理（仅主进程）
-            t_vision = None
-            t_last = None
-            t_action = None
-
-            if accelerator.is_main_process and teacher is not None and teacher_batch is not None:
-                t_hook_modules = {}
-                if dc.feature_distill:
-                    t_hook_modules = {
-                        "teacher_vision": teacher.model.vlm.vision_tower,
-                        "teacher_last": teacher.model.transformer.blocks[-1],
-                    }
-                with MultiHookManager(t_hook_modules) as t_hooks, \
-                     torch.no_grad(), \
-                     torch.amp.autocast("cuda", dtype=torch.float16):
-                    t_inputs = teacher._build_model_inputs(teacher_batch)
+                if teacher is not None and teacher_batch is not None:
+                    t_hook_modules = {}
                     if dc.feature_distill:
-                        teacher.model.forward_vlm(
+                        t_hook_modules = {
+                            "teacher_last": teacher.model.transformer.blocks[-1],
+                        }
+                    with MultiHookManager(t_hook_modules) as t_hooks, \
+                         torch.no_grad(), \
+                         torch.amp.autocast("cuda", dtype=torch.float16):
+                        t_inputs = teacher._build_model_inputs(teacher_batch)
+                        enc = teacher.model.forward_vlm(
                             input_ids=t_inputs["input_ids"],
                             pixel_values=t_inputs["image_input"],
                             image_mask=t_inputs["image_mask"],
                         )
-                        t_vision = t_hooks["teacher_vision"].output.float()
-                        t_last = t_hooks["teacher_last"].output.float()
-                    if dc.logit_distill:
-                        t_action = teacher.model.generate_actions(
-                            input_ids=t_inputs["input_ids"],
-                            image_input=t_inputs["image_input"],
-                            image_mask=t_inputs["image_mask"],
-                            domain_id=t_inputs["domain_id"],
-                            proprio=t_inputs["proprio"],
-                            steps=teacher.config.num_denoising_steps,
-                        ).float()
+                        if dc.feature_distill:
+                            t_vision = enc["vlm_features"].float()
+                        if dc.logit_distill:
+                            t_action = teacher.model.generate_actions(
+                                input_ids=t_inputs["input_ids"],
+                                image_input=t_inputs["image_input"],
+                                image_mask=t_inputs["image_mask"],
+                                domain_id=t_inputs["domain_id"],
+                                proprio=t_inputs["proprio"],
+                                steps=teacher.config.num_denoising_steps,
+                            ).float()
+                        if dc.feature_distill:
+                            t_last = t_hooks["teacher_last"].output.float()
 
-            with MultiHookManager(s_hook_modules) as s_hooks:
-                # 需要学生再次前向以捕获 hook（已经在上方 task loss 计算时前向，
-                # 若特征未被 hook，这里补一次轻量前向）
-                if dc.feature_distill:
-                    with torch.no_grad(), accelerator.autocast():
-                        student.forward(student_batch)
-
-                # ── 特征蒸馏 ─────────────────────────────────────────────────
                 if dc.feature_distill:
                     dev = accelerator.device
-                    # 广播教师特征到所有进程
-                    if accelerator.is_main_process:
-                        t_vision = t_vision.to(dev)
-                        t_last = t_last.to(dev)
-                    else:
-                        # 占位张量（形状以学生特征推断，广播后会被覆盖）
-                        sv_shape = s_hooks["student_vision"].output.shape
-                        se_shape = s_hooks["student_last"].output.shape
-                        t_vision = torch.zeros(sv_shape[0], sv_shape[1],
-                                               dc.teacher_vision_dim, device=dev)
-                        t_last = torch.zeros(se_shape[0], se_shape[1],
-                                             dc.teacher_expert_dim, device=dev)
-                    accelerator.broadcast(t_vision, src=0)
-                    accelerator.broadcast(t_last, src=0)
-
+                    vlm_with_expert = student_model.model.vlm_with_expert
+                    se_cached = vlm_with_expert._last_expert_output
                     sv = s_hooks["student_vision"].output.float()
+                    if step == 0:
+                        print(
+                            f"[rank{accelerator.process_index}] DEBUG feature shapes: "
+                            f"student_vision={tuple(sv.shape)} teacher_vision={tuple(t_vision.shape) if t_vision is not None else None} "
+                            f"student_expert={tuple(se_cached.shape) if se_cached is not None else None} "
+                            f"teacher_last={tuple(t_last.shape) if t_last is not None else None}",
+                            flush=True,
+                        )
                     sv = align_seq_len(sv, t_vision)
                     sv_proj = adapters.adapt_vision(sv)
                     loss_vis = F.mse_loss(sv_proj, t_vision.detach())
                     distill_loss = distill_loss + dc.alpha_feature * loss_vis
                     log["loss_vision_feat"] = loss_vis.item()
 
-                    se = s_hooks["student_last"].output.float()
+                    se = se_cached.to(dev).float()
                     se = align_seq_len(se, t_last)
                     se_proj = adapters.adapt_expert(se)
                     loss_exp = F.mse_loss(se_proj, t_last.detach())
                     distill_loss = distill_loss + dc.alpha_feature * loss_exp
                     log["loss_expert_feat"] = loss_exp.item()
 
-                # ── Logit 蒸馏 ───────────────────────────────────────────────
-                if dc.logit_distill and student_pred_action is not None:
-                    dev = accelerator.device
-                    if accelerator.is_main_process:
-                        t_action = t_action.to(dev)
-                    else:
-                        t_action = torch.zeros(
-                            student_pred_action.shape[0],
-                            student_pred_action.shape[1],
-                            dc.teacher_action_dim,
-                            device=dev,
-                        )
-                    accelerator.broadcast(t_action, src=0)
+                if dc.logit_distill:
+                    with torch.no_grad(), accelerator.autocast():
+                        images, img_masks = student_model.prepare_images(student_batch)
+                        state = student_model.prepare_state(student_batch)
+                        lang_tokens = student_batch[f"{OBS_LANGUAGE_TOKENS}"]
+                        lang_masks = student_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+                        student_pred_action = student_model.model.sample_actions(
+                            images, img_masks, lang_tokens, lang_masks, state
+                        ).detach()
+                        student_pred_action = student_pred_action[..., : dc.student_action_dim]
+                        if step == 0:
+                            print(
+                                f"[rank{accelerator.process_index}] DEBUG action shapes: "
+                                f"student_action={tuple(student_pred_action.shape)} teacher_action={tuple(t_action.shape) if t_action is not None else None}",
+                                flush=True,
+                            )
 
                     s_act = student_pred_action.float()
-                    t_act = t_action[:, : s_act.shape[1], : dc.teacher_action_dim]
+                    min_T = min(s_act.shape[1], t_action.shape[1])
+                    s_act = s_act[:, :min_T, :]
+                    t_act = t_action[:, :min_T, : dc.teacher_action_dim]
                     s_act_proj = adapters.adapt_action(s_act)
                     T = dc.temperature
                     loss_kl = F.kl_div(
@@ -330,23 +304,23 @@ def update_distill(
                     distill_loss = distill_loss + dc.alpha_logit * loss_kl
                     log["loss_kl_action"] = loss_kl.item()
 
-        # ── 3. 总损失 ────────────────────────────────────────────────────────
-        total_loss = dc.alpha_task * task_loss + dc.alpha_distill * distill_loss
+            # ── 3. 总损失 ────────────────────────────────────────────────────
+            total_loss = dc.alpha_task * task_loss + dc.alpha_distill * distill_loss
 
-        # ── 4. 反向 ─────────────────────────────────────────────────────────
-        accelerator.backward(total_loss)
+            # ── 4. 反向 ─────────────────────────────────────────────────────
+            accelerator.backward(total_loss)
 
-        # ── 5. 梯度裁剪 + 优化器步进 ────────────────────────────────────────
-        if grad_clip_norm > 0:
-            grad_norm = accelerator.clip_grad_norm_(
-                list(student.parameters()) + list(adapters.parameters()),
-                grad_clip_norm,
-            )
-        else:
-            grad_norm = torch.tensor(0.0)
+            # ── 5. 梯度裁剪 + 优化器步进 ──────────────────────────────────
+            if grad_clip_norm > 0:
+                grad_norm = accelerator.clip_grad_norm_(
+                    list(student.parameters()) + list(adapters.parameters()),
+                    grad_clip_norm,
+                )
+            else:
+                grad_norm = torch.tensor(0.0)
 
-        optimizer.step()
-        optimizer.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
 
     if lr_scheduler is not None:
         lr_scheduler.step()
@@ -430,13 +404,13 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         dataset_stats=dataset.meta.stats,
     )
 
-    # ── 教师模型（仅主进程）──────────────────────────────────────────────────
+    # ── 教师模型（各 rank 本地加载）────────────────────────────────────────────
     accelerator.wait_for_everyone()
     teacher = load_teacher(cfg, accelerator)
 
-    # 教师预处理器（主进程）
+    # 教师预处理器（各 rank 本地创建）
     teacher_preprocessor = None
-    if is_main and teacher is not None:
+    if teacher is not None:
         teacher_preprocessor, _ = make_pre_post_processors(
             policy_cfg=teacher.config,
             pretrained_path=Path(cfg.distill.teacher_path),
@@ -540,7 +514,8 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
     student, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         student, optimizer, dataloader, lr_scheduler
     )
-    adapters = accelerator.prepare(adapters)
+    # Do NOT wrap adapters in DDP — its parameters are already in the optimizer
+    # and DDP would shadow the custom methods (adapt_vision, adapt_expert, etc.).
     dl_iter = cycle(dataloader)
 
     # ── 指标跟踪 ─────────────────────────────────────────────────────────────
@@ -584,7 +559,7 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         t_data = time.perf_counter()
         raw_batch = next(dl_iter)
         student_batch = preprocessor(raw_batch)
-        teacher_batch = teacher_preprocessor(raw_batch) if (is_main and teacher_preprocessor) else None
+        teacher_batch = teacher_preprocessor(raw_batch) if teacher_preprocessor else None
         train_tracker.dataloading_s = time.perf_counter() - t_data
 
         train_tracker, output_dict = update_distill(
