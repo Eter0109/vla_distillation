@@ -311,6 +311,12 @@ def update_distill(
             # ── 4. 反向 ─────────────────────────────────────────────────────
             accelerator.backward(total_loss)
 
+            # 手动同步 adapter 梯度（adapters 未包装 DDP，梯度不会自动 all-reduce）
+            if accelerator.sync_gradients and accelerator.num_processes > 1:
+                for p in adapters.parameters():
+                    if p.grad is not None:
+                        torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+
             # ── 5. 梯度裁剪 + 优化器步进 ──────────────────────────────────
             if grad_clip_norm > 0:
                 grad_norm = accelerator.clip_grad_norm_(
@@ -323,7 +329,7 @@ def update_distill(
             optimizer.step()
             optimizer.zero_grad()
 
-    if lr_scheduler is not None:
+    if lr_scheduler is not None and accelerator.sync_gradients:
         lr_scheduler.step()
 
     log.update({
@@ -466,7 +472,7 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
 
     # ── 断点恢复 ─────────────────────────────────────────────────────────────
     step = 0
-    if cfg.resume:
+    if cfg.resume and cfg.checkpoint_path is not None:
         step, optimizer, lr_scheduler = load_training_state(
             cfg.checkpoint_path, optimizer, lr_scheduler
         )
@@ -484,8 +490,8 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
-        effective_bs = cfg.batch_size * accelerator.num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {accelerator.num_processes} = {effective_bs}")
+        effective_bs = cfg.batch_size * accelerator.num_processes * cfg.grad_accum_steps
+        logging.info(f"Effective batch size: {cfg.batch_size} x {accelerator.num_processes} x {cfg.grad_accum_steps} = {effective_bs}")
         logging.info(f"{num_learnable=} ({format_big_number(num_learnable)})")
         logging.info(f"{num_total=} ({format_big_number(num_total)})")
 
