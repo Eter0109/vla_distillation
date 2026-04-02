@@ -9,7 +9,7 @@ VLA 蒸馏训练脚本（src/distill.py）
 - 工具：MetricsTracker / AverageMeter / WandBLogger / save_checkpoint
 
 教师模型（XVLA）：
-  - 仅主进程加载，fp16 冻结推理，部署在 teacher_device（默认 cuda:1）
+  - 各 rank 本地加载，fp16 冻结推理，部署在对应 rank 的 accelerator.device
   - 中间特征通过 accelerator.broadcast 同步到所有 DDP 进程
 
 学生模型（SmolVLA）：
@@ -89,7 +89,6 @@ class DistillConfig:
     temperature: float = 2.0
     # 教师模型
     teacher_path: str = ""
-    teacher_device: str = "cuda:0"
     teacher_dtype: str = "float16"
     # 适配层维度
     student_vision_dim: int = 960
