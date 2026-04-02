@@ -38,7 +38,6 @@ distill:
   temperature: 2.0
   # 教师模型
   teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model
-  teacher_device: cuda:1
   teacher_dtype: float16
   # 适配层维度
   student_vision_dim: 960
