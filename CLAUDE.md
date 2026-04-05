@@ -17,11 +17,11 @@ export PYTHONPATH="/hqlab/workspace/zhaozy/lerobot/src:src/:${PYTHONPATH:-}"
 
 ## Key Commands
 
-**Start distillation training (4-GPU DDP):**
+**Start distillation training (multi-GPU DDP):**
 ```bash
 bash scripts/train_distill.sh
 # Device/hyperparameter overrides:
-TEACHER_DEVICE=cuda:1 STUDENT_DEVICES=2,3,4,5 bash scripts/train_distill.sh
+STUDENT_DEVICES=2,3,4,5 bash scripts/train_distill.sh
 bash scripts/train_distill.sh --batch_size 4 --steps 10000
 # Ablations:
 bash scripts/train_distill.sh --feature_distill false --logit_distill true   # logit only
@@ -59,8 +59,8 @@ This project distills XVLA (teacher, Florence2-based VLA) into SmolVLA (student,
 | `EpisodeAwareSampler` + `cycle` | identical |
 
 ### Hardware layout
-- Teacher (XVLA): `accelerator.device` per rank — frozen fp16, loaded on every rank independently (no DDP)
-- Student (SmolVLA): `cuda:2,3,4,5` — 4-GPU DDP via `accelerator.prepare`, mixed precision
+- Teacher (XVLA): loaded on each rank's `accelerator.device` — frozen fp16, no DDP, independent per rank
+- Student (SmolVLA): all GPUs in `STUDENT_DEVICES` (default `0,1,2,3`) — DDP via `accelerator.prepare`, mixed precision
 
 ### Training data flow per step
 1. `next(dl_iter)` → `preprocessor(batch)` for student; `teacher_preprocessor(batch)` on every rank
@@ -127,7 +127,7 @@ outputs/distill/checkpoints/
 Top-level keys map directly to `TrainPipelineConfig` / `DistillTrainPipelineConfig` fields. Key fields to verify before running:
 
 - `student_path` — pretrained SmolVLA directory
-- `distill.teacher_path` / `distill.teacher_device` — XVLA model path and GPU
+- `distill.teacher_path` — XVLA model path (loads on each rank's device automatically)
 - `dataset.root` / `dataset.repo_id` — local LIBERO dataset
 - `output_dir` — where checkpoints and logs land
 - `wandb.enable` — requires `wandb login` beforehand
