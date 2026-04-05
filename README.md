@@ -35,8 +35,8 @@ conda activate lerobot
 ```
 
 **硬件默认分配：**
-- 教师模型（XVLA）：`cuda:1`（单卡，冻结，fp16 推理）
-- 学生模型（SmolVLA）：`cuda:2,3,4,5`（4卡 DDP，混合精度训练）
+- 教师模型（XVLA）：每个 rank 的 `accelerator.device`（冻结，fp16 推理，随学生卡自动分配）
+- 学生模型（SmolVLA）：`STUDENT_DEVICES`（默认 `0,1,2,3`，DDP，混合精度训练）
 
 ---
 
@@ -48,26 +48,25 @@ conda activate lerobot
 
 ```yaml
 dataset:
-  path: /hqlab/workspace/zhaozy/data/libero
-  repo_id: libero_local
+  root: /path/to/datasets/libero
+  repo_id: libero
 
-teacher:
-  path: /hqlab/workspace/zhaozy/models/xvla-libero-model
-  device: cuda:1
+distill:
+  teacher_path: /path/to/models/xvla-libero-model
+  teacher_dtype: float16
 
-student:
-  path: /hqlab/workspace/zhaozy/models/smolvla_libero
-  devices: [2, 3, 4, 5]
+student_path: /path/to/models/smolvla_libero
+output_dir: outputs/distill
 ```
 
 ### 2. 启动训练
 
 ```bash
-# 默认配置（教师 cuda:1，学生 cuda:2-5）
+# 默认配置（学生 cuda:0-3，教师随学生卡自动分配）
 bash scripts/train_distill.sh
 
 # 自定义设备和超参
-TEACHER_DEVICE=5 STUDENT_DEVICES=4 \
+STUDENT_DEVICES=0,1 \
 bash scripts/train_distill.sh \
 --batch_size 1 \
 --steps 10
