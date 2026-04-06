@@ -105,6 +105,8 @@ class DistillTrainPipelineConfig(TrainPipelineConfig):
     distill: DistillConfig = field(default_factory=DistillConfig)
     # 学生模型路径（同 policy.pretrained_path，单独保留以兼容现有 YAML）
     student_path: str = ""
+    # 可选：显式指定恢复训练的 checkpoint 目录
+    checkpoint_path: str | None = None
     # 梯度累积步数
     grad_accum_steps: int = 1
 
@@ -501,11 +503,19 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
 
     # ── 断点恢复 ─────────────────────────────────────────────────────────────
     step = 0
-    if cfg.resume and cfg.checkpoint_path is not None:
+    if cfg.resume:
+        resume_ckpt = cfg.checkpoint_path or str(Path(cfg.output_dir) / "checkpoints" / "last")
+        resume_ckpt_path = Path(resume_ckpt)
+        if not resume_ckpt_path.exists():
+            raise FileNotFoundError(
+                f"resume=True 但未找到恢复检查点: {resume_ckpt_path}。"
+                "可通过 --checkpoint_path 显式指定，或确认 output_dir/checkpoints/last 存在。"
+            )
+
         step, optimizer, lr_scheduler = load_training_state(
-            cfg.checkpoint_path, optimizer, lr_scheduler
+            resume_ckpt_path, optimizer, lr_scheduler
         )
-        adapters_ckpt = Path(cfg.checkpoint_path) / "adapters.pt"
+        adapters_ckpt = resume_ckpt_path / "adapters.pt"
         if adapters_ckpt.exists():
             adapters.load_state_dict(torch.load(adapters_ckpt, map_location="cpu"))
             logging.info(colored(f"已从 {adapters_ckpt} 恢复 adapters 权重", "green"))
