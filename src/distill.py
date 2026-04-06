@@ -139,6 +139,16 @@ def load_teacher(cfg: DistillTrainPipelineConfig, accelerator: Accelerator) -> P
     teacher_cls = get_policy_class("xvla")
     teacher = teacher_cls.from_pretrained(dc.teacher_path)
     teacher = teacher.to(device=accelerator.device, dtype=teacher_dtype)
+    # Distillation does not need decoding KV cache. Keeping it disabled avoids
+    # extra attention memory usage.
+    for mod in (teacher, getattr(teacher, "model", None)):
+        if mod is None:
+            continue
+        cfg_obj = getattr(mod, "config", None)
+        if cfg_obj is not None and hasattr(cfg_obj, "use_cache"):
+            cfg_obj.use_cache = False
+        if hasattr(mod, "use_cache"):
+            setattr(mod, "use_cache", False)
     for p in teacher.parameters():
         p.requires_grad = False
     teacher.eval()
@@ -161,6 +171,23 @@ def load_student(cfg: DistillTrainPipelineConfig) -> PreTrainedPolicy:
     if lm_expert is not None and hasattr(lm_expert, "gradient_checkpointing_enable"):
         lm_expert.gradient_checkpointing_enable()
         logging.info("学生 lm_expert 梯度检查点已启用")
+
+    # Gradient checkpointing should be paired with use_cache=False, otherwise
+    # attention memory can spike in custom VLM blocks.
+    for mod in (
+        student,
+        getattr(student, "model", None),
+        getattr(student.model, "vlm_with_expert", None),
+        vlm,
+        lm_expert,
+    ):
+        if mod is None:
+            continue
+        cfg_obj = getattr(mod, "config", None)
+        if cfg_obj is not None and hasattr(cfg_obj, "use_cache"):
+            cfg_obj.use_cache = False
+        if hasattr(mod, "use_cache"):
+            setattr(mod, "use_cache", False)
 
     student.train()
     return student
@@ -194,6 +221,7 @@ def update_distill(
     dc = cfg.distill
     in_warmup = step < dc.warmup_steps
     log = {}
+    grad_norm = torch.tensor(0.0, device=accelerator.device)
 
     student.train()
 
@@ -316,17 +344,19 @@ def update_distill(
                     if p.grad is not None:
                         torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
 
-            # ── 5. 梯度裁剪 + 优化器步进 ──────────────────────────────────
-            if grad_clip_norm > 0:
-                grad_norm = accelerator.clip_grad_norm_(
-                    list(student.parameters()) + list(adapters.parameters()),
-                    grad_clip_norm,
-                )
-            else:
-                grad_norm = torch.tensor(0.0)
+            # ── 5. 梯度裁剪 + 优化器步进（仅在累积边界执行）──────────────────
+            if accelerator.sync_gradients:
+                if grad_clip_norm > 0:
+                    grad_norm = accelerator.clip_grad_norm_(
+                        list(student.parameters()) + list(adapters.parameters()),
+                        grad_clip_norm,
+                    )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            optimizer.step()
-            optimizer.zero_grad()
+            # 及时释放该步缓存的 expert 输出引用，降低显存滞留风险。
+            if hasattr(student_model.model, "vlm_with_expert"):
+                student_model.model.vlm_with_expert._last_expert_output = None
 
     if lr_scheduler is not None and accelerator.sync_gradients:
         lr_scheduler.step()
