@@ -156,6 +156,7 @@ torchrun --nproc_per_node=4 src/distill.py --config configs/distill_config.yaml
 | `alpha_feature` | 0.4 | 特征蒸馏子权重 |
 | `warmup_steps` | 500 | 仅任务损失的预热步数 |
 | `temperature` | 2.0 | KL 蒸馏温度系数 |
+| `teacher_transformer_last_layer_attr` | `blocks` | 教师 transformer 最后一层容器名，默认解析 `teacher.model.transformer.blocks[-1]` |
 | `total_steps` | 30000 | 总训练步数 |
 | `batch_size` | 8 | 每卡 batch size |
 | `accum_steps` | 4 | 梯度累积步数 |
@@ -205,4 +206,4 @@ policy = load_student_policy(
 - **不修改 lerobot 源码**：所有新增逻辑（适配层、hook、训练脚本）均在 `vla_distillation/` 下
 - 教师模型在推理时全程 `torch.no_grad()` + `fp16 autocast`，不参与反向传播
 - 序列长度不同时（教师 vs 学生 token 数），`align_seq_len()` 自动截断/零填充学生特征
-- XVLA `transformer.blocks` 若实际为 `.layers`，可在 `configs/distill_config.yaml` 中通过 `teacher.transformer_last_layer_attr` 字段调整（或直接修改 `distill.py` 第 341 行）
+- XVLA `transformer.blocks` 若实际为 `.layers`，可在 `configs/distill_config.yaml` 中通过 `distill.teacher_transformer_last_layer_attr` 字段调整

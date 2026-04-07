@@ -39,6 +39,7 @@ distill:
   # 教师模型
   teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model
   teacher_dtype: float16
+  teacher_transformer_last_layer_attr: blocks
   # 适配层维度
   student_vision_dim: 960
   teacher_vision_dim: 1024

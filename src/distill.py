@@ -90,6 +90,7 @@ class DistillConfig:
     # 教师模型
     teacher_path: str = ""
     teacher_dtype: str = "float16"
+    teacher_transformer_last_layer_attr: str = "blocks"
     # 适配层维度
     student_vision_dim: int = 960
     teacher_vision_dim: int = 1024
@@ -195,6 +196,84 @@ def load_student(cfg: DistillTrainPipelineConfig) -> PreTrainedPolicy:
     return student
 
 
+def resolve_teacher_last_layer(
+    teacher: PreTrainedPolicy,
+    cfg: DistillTrainPipelineConfig,
+) -> tuple[torch.nn.Module, str]:
+    """Resolve the teacher transformer's last layer for feature hooking."""
+    layer_attr = cfg.distill.teacher_transformer_last_layer_attr
+    transformer = getattr(getattr(teacher, "model", None), "transformer", None)
+    if transformer is None:
+        raise AttributeError("Teacher model is missing `model.transformer`; cannot capture `teacher_last`.")
+
+    layer_container = getattr(transformer, layer_attr, None)
+    layer_path = f"teacher.model.transformer.{layer_attr}"
+    if layer_container is None:
+        available = [name for name in ("blocks", "layers") if hasattr(transformer, name)]
+        raise AttributeError(
+            f"Teacher transformer has no `{layer_attr}` container at `{layer_path}`. "
+            f"Available candidates: {available or 'none'}."
+        )
+
+    try:
+        if len(layer_container) == 0:
+            raise ValueError(f"`{layer_path}` is empty.")
+        return layer_container[-1], f"{layer_path}[-1]"
+    except TypeError as exc:
+        raise TypeError(
+            f"`{layer_path}` is not an indexable layer container; got type {type(layer_container).__name__}."
+        ) from exc
+
+
+def extract_teacher_feature_targets(
+    teacher: PreTrainedPolicy,
+    teacher_batch: dict,
+    cfg: DistillTrainPipelineConfig,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, str, str]:
+    """Run XVLA encoder + transformer once to capture feature distillation targets."""
+    teacher_last_layer, teacher_last_layer_path = resolve_teacher_last_layer(teacher, cfg)
+    teacher_last_layer_type = type(teacher_last_layer).__name__
+
+    t_inputs = teacher._build_model_inputs(teacher_batch)
+    teacher_model = teacher.model
+    target_dtype = (
+        teacher_model._get_target_dtype()
+        if hasattr(teacher_model, "_get_target_dtype")
+        else t_inputs["image_input"].dtype
+    )
+
+    enc = teacher_model.forward_vlm(
+        input_ids=t_inputs["input_ids"],
+        pixel_values=t_inputs["image_input"],
+        image_mask=t_inputs["image_mask"],
+    )
+    t_vision = enc["vlm_features"].float()
+
+    batch_size = t_inputs["input_ids"].shape[0]
+    dummy_action = torch.zeros(
+        batch_size,
+        teacher_model.chunk_size,
+        teacher_model.dim_action,
+        device=t_inputs["input_ids"].device,
+        dtype=target_dtype,
+    )
+    t = torch.ones(batch_size, device=dummy_action.device, dtype=target_dtype)
+    proprio = t_inputs["proprio"].to(dtype=target_dtype)
+    proprio_m, action_with_noise = teacher_model.action_space.preprocess(proprio, dummy_action)
+
+    with MultiHookManager({"teacher_last": teacher_last_layer}) as t_hooks:
+        teacher_model.transformer(
+            domain_id=t_inputs["domain_id"],
+            action_with_noise=action_with_noise,
+            proprio=proprio_m,
+            t=t,
+            **enc,
+        )
+        t_last = t_hooks["teacher_last"].output
+
+    return t_vision, t_last.float() if t_last is not None else None, teacher_last_layer_path, teacher_last_layer_type
+
+
 # =============================================================================
 # 单步蒸馏更新（对应 lerobot_train.update_policy）
 # =============================================================================
@@ -246,25 +325,18 @@ def update_distill(
                 t_vision = None
                 t_last = None
                 t_action = None
+                teacher_last_layer_path = ""
+                teacher_last_layer_type = ""
 
                 if teacher is not None and teacher_batch is not None:
-                    t_hook_modules = {}
-                    if dc.feature_distill:
-                        t_hook_modules = {
-                            "teacher_last": teacher.model.transformer.blocks[-1],
-                        }
-                    with MultiHookManager(t_hook_modules) as t_hooks, \
-                         torch.no_grad(), \
-                         torch.amp.autocast("cuda", dtype=torch.float16):
-                        t_inputs = teacher._build_model_inputs(teacher_batch)
-                        enc = teacher.model.forward_vlm(
-                            input_ids=t_inputs["input_ids"],
-                            pixel_values=t_inputs["image_input"],
-                            image_mask=t_inputs["image_mask"],
-                        )
+                    teacher_dtype = getattr(teacher.model, "_get_target_dtype", lambda: torch.float16)()
+                    with torch.no_grad(), torch.amp.autocast("cuda", dtype=teacher_dtype):
                         if dc.feature_distill:
-                            t_vision = enc["vlm_features"].float()
+                            t_vision, t_last, teacher_last_layer_path, teacher_last_layer_type = (
+                                extract_teacher_feature_targets(teacher, teacher_batch, cfg)
+                            )
                         if dc.logit_distill:
+                            t_inputs = teacher._build_model_inputs(teacher_batch)
                             t_action = teacher.model.generate_actions(
                                 input_ids=t_inputs["input_ids"],
                                 image_input=t_inputs["image_input"],
@@ -273,23 +345,30 @@ def update_distill(
                                 proprio=t_inputs["proprio"],
                                 steps=teacher.config.num_denoising_steps,
                             ).float()
-                        if dc.feature_distill:
-                            t_last = t_hooks["teacher_last"].output.float()
 
                 if dc.feature_distill:
                     dev = accelerator.device
                     vlm_with_expert = student_model.model.vlm_with_expert
                     se_cached = vlm_with_expert._last_expert_output
-                    sv = s_hooks["student_vision"].output.float()
+                    sv_raw = s_hooks["student_vision"].output if student_vision_module else None
+                    sv = sv_raw.float() if sv_raw is not None else None
                     if step == 0 and accelerator.is_main_process:
                         logging.info(
                             f"[DEBUG] feature shapes: "
-                            f"student_vision={tuple(sv.shape)} teacher_vision={tuple(t_vision.shape) if t_vision is not None else None} "
+                            f"student_vision={tuple(sv.shape) if sv is not None else None} "
+                            f"teacher_vision={tuple(t_vision.shape) if t_vision is not None else None} "
                             f"student_expert={tuple(se_cached.shape) if se_cached is not None else None} "
                             f"teacher_last={tuple(t_last.shape) if t_last is not None else None}"
                         )
-                    if t_vision is None or se_cached is None:
-                        logging.warning("feature_distill=True 但 t_vision 或 se_cached 为 None，跳过特征蒸馏本步")
+                        if t_last is None and teacher_last_layer_path:
+                            logging.info(
+                                f"[DEBUG] teacher_last unresolved: path={teacher_last_layer_path} "
+                                f"type={teacher_last_layer_type or 'unknown'}"
+                            )
+                    if sv is None or t_vision is None:
+                        logging.warning(
+                            "feature_distill=True 但 student_vision 或 teacher_vision 为 None，跳过 vision 特征蒸馏本步"
+                        )
                     else:
                         sv = align_seq_len(sv, t_vision)
                         sv_proj = adapters.adapt_vision(sv)
@@ -297,6 +376,18 @@ def update_distill(
                         distill_loss = distill_loss + dc.alpha_feature * loss_vis
                         log["loss_vision_feat"] = loss_vis.item()
 
+                    if se_cached is None or t_last is None:
+                        warning = (
+                            "feature_distill=True 但 student_expert 或 teacher_last 为 None，"
+                            "跳过 expert 特征蒸馏本步"
+                        )
+                        if t_last is None and teacher_last_layer_path:
+                            warning += (
+                                f" (resolved layer: {teacher_last_layer_path}, "
+                                f"type={teacher_last_layer_type or 'unknown'})"
+                            )
+                        logging.warning(warning)
+                    else:
                         se = se_cached.to(dev).float()
                         se = align_seq_len(se, t_last)
                         se_proj = adapters.adapt_expert(se)
@@ -320,19 +411,22 @@ def update_distill(
                                 f"student_action={tuple(student_pred_action.shape)} teacher_action={tuple(t_action.shape) if t_action is not None else None}"
                             )
 
-                    s_act = student_pred_action.float()
-                    min_T = min(s_act.shape[1], t_action.shape[1])
-                    s_act = s_act[:, :min_T, :]
-                    t_act = t_action[:, :min_T, : dc.teacher_action_dim]
-                    s_act_proj = adapters.adapt_action(s_act)
-                    T = dc.temperature
-                    loss_kl = F.kl_div(
-                        F.log_softmax(s_act_proj / T, dim=-1),
-                        F.softmax(t_act.detach() / T, dim=-1),
-                        reduction="batchmean",
-                    ) * (T ** 2)
-                    distill_loss = distill_loss + dc.alpha_logit * loss_kl
-                    log["loss_kl_action"] = loss_kl.item()
+                    if t_action is None:
+                        logging.warning("logit_distill=True 但 teacher_action 为 None，跳过 logit 蒸馏本步")
+                    else:
+                        s_act = student_pred_action.float()
+                        min_T = min(s_act.shape[1], t_action.shape[1])
+                        s_act = s_act[:, :min_T, :]
+                        t_act = t_action[:, :min_T, : dc.teacher_action_dim]
+                        s_act_proj = adapters.adapt_action(s_act)
+                        T = dc.temperature
+                        loss_kl = F.kl_div(
+                            F.log_softmax(s_act_proj / T, dim=-1),
+                            F.softmax(t_act.detach() / T, dim=-1),
+                            reduction="batchmean",
+                        ) * (T ** 2)
+                        distill_loss = distill_loss + dc.alpha_logit * loss_kl
+                        log["loss_kl_action"] = loss_kl.item()
 
             # ── 3. 总损失 ────────────────────────────────────────────────────
             total_loss = dc.alpha_task * task_loss + dc.alpha_distill * distill_loss
