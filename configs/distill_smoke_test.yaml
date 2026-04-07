@@ -1,0 +1,56 @@
+# ============================================================
+# distill_smoke_test.yaml — 冒烟测试配置
+# 用于快速验证训练链路、teacher/student 特征蒸馏、resume 逻辑
+# ============================================================
+
+# ── 训练循环（对应 TrainPipelineConfig 顶层字段）────────────
+batch_size: 1
+steps: 5
+log_freq: 1
+save_freq: 2
+num_workers: 0
+seed: 42
+save_checkpoint: true
+grad_accum_steps: 1
+student_path: /hqlab/workspace/zhaozy/models/smolvla_libero
+
+# ── 数据集（DatasetConfig）──────────────────────────────────
+dataset:
+  repo_id: libero
+  root: /hqlab/workspace/zhaozy/datasets/libero
+
+# ── 优化器 & 调度器：由 distill.py 内联创建，不经过 draccus ────
+use_policy_training_preset: false
+
+# ── 蒸馏配置（DistillConfig）────────────────────────────────
+distill:
+  # 损失权重
+  alpha_task: 1.0
+  alpha_distill: 0.5
+  alpha_feature: 0.4
+  alpha_logit: 0.6
+  # 蒸馏开关
+  feature_distill: true
+  logit_distill: true
+  # 冒烟测试默认从第 0 步就启用蒸馏，便于尽早暴露问题
+  warmup_steps: 0
+  temperature: 2.0
+  # 教师模型
+  teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model
+  teacher_dtype: float16
+  teacher_transformer_last_layer_attr: blocks
+  # 适配层维度
+  student_vision_dim: 960
+  teacher_vision_dim: 1024
+  student_expert_dim: 480
+  teacher_expert_dim: 1024
+  student_action_dim: 7
+  teacher_action_dim: 20
+
+# ── 输出路径 ─────────────────────────────────────────────────
+output_dir: outputs/distill_smoke_test
+
+# ── WandB（WandBConfig）──────────────────────────────────────
+wandb:
+  enable: false
+  project: vla_distillation

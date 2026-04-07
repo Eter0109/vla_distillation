@@ -7,13 +7,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from typing import Any
 
 
 class FeatureHook:
-    """注册在 nn.Module 上的前向钩子，捕获模块输出（detach + clone）。
+    """注册在 nn.Module 上的前向钩子，捕获模块输出。
 
     用法::
 
@@ -23,16 +24,27 @@ class FeatureHook:
         hook.close()         # 移除钩子，避免内存泄漏
     """
 
-    def __init__(self, module: nn.Module):
+    def __init__(self, module: nn.Module, detach: bool = True, clone: bool = True):
         self.output: Any = None
+        self.detach = detach
+        self.clone = clone
         self._handle = module.register_forward_hook(self._hook_fn)
+
+    def _store(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        if self.detach:
+            tensor = tensor.detach()
+        if self.clone:
+            tensor = tensor.clone()
+        return tensor
 
     def _hook_fn(self, module: nn.Module, input: Any, output: Any) -> None:
         # 若输出为 tuple，取第一个元素（通常为隐层状态）
         if isinstance(output, tuple):
-            self.output = output[0].detach().clone()
+            self.output = self._store(output[0])
         elif isinstance(output, torch.Tensor):
-            self.output = output.detach().clone()
+            self.output = self._store(output)
         else:
             # HuggingFace ModelOutput (dataclass)：取 last_hidden_state 或第一个 Tensor 字段
             tensor = getattr(output, "last_hidden_state", None)
@@ -42,7 +54,7 @@ class FeatureHook:
                     if isinstance(v, torch.Tensor):
                         tensor = v
                         break
-            self.output = tensor.detach().clone() if tensor is not None else None
+            self.output = self._store(tensor)
 
     def close(self) -> None:
         """移除钩子，释放资源。"""
@@ -74,9 +86,13 @@ class MultiHookManager:
             tv = hooks["teacher_vision"].output
     """
 
-    def __init__(self, name_to_module: dict[str, nn.Module]):
+    def __init__(self, name_to_module: dict[str, nn.Module | "HookSpec"]):
         self._hooks: dict[str, FeatureHook] = {
-            name: FeatureHook(module) for name, module in name_to_module.items()
+            name: FeatureHook(spec.module, detach=spec.detach, clone=spec.clone)
+            for name, spec in {
+                name: (value if isinstance(value, HookSpec) else HookSpec(module=value))
+                for name, value in name_to_module.items()
+            }.items()
         }
 
     def __getitem__(self, name: str) -> FeatureHook:
@@ -91,3 +107,10 @@ class MultiHookManager:
 
     def __exit__(self, *args):
         self.close_all()
+
+
+@dataclass(frozen=True)
+class HookSpec:
+    module: nn.Module
+    detach: bool = True
+    clone: bool = True

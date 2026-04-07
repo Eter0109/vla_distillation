@@ -76,6 +76,12 @@ bash scripts/train_distill.sh --feature_distill false --logit_distill false
 
 # 仅 logit 蒸馏（无特征蒸馏）
 bash scripts/train_distill.sh --feature_distill false --logit_distill true
+
+# 从指定 checkpoint 完整恢复训练
+bash scripts/train_distill.sh --resume true --checkpoint_path outputs/distill/checkpoints/000200
+
+# 不显式指定 checkpoint_path 时，默认恢复 output_dir/checkpoints/last
+bash scripts/train_distill.sh --resume true
 ```
 
 ### 3. 评测学生模型
@@ -207,3 +213,4 @@ policy = load_student_policy(
 - 教师模型在推理时全程 `torch.no_grad()` + `fp16 autocast`，不参与反向传播
 - 序列长度不同时（教师 vs 学生 token 数），`align_seq_len()` 自动截断/零填充学生特征
 - XVLA `transformer.blocks` 若实际为 `.layers`，可在 `configs/distill_config.yaml` 中通过 `distill.teacher_transformer_last_layer_attr` 字段调整
+- `resume=true` 时会从 checkpoint 根目录下的 `pretrained_model/`、`training_state/` 和 `adapters.pt` 一起恢复；`checkpoint_path` 应指向如 `outputs/distill/checkpoints/000200` 的目录，而不是其 `pretrained_model/` 子目录

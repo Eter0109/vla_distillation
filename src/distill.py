@@ -67,6 +67,7 @@ from lerobot.utils.utils import (
 from adapters import DistillAdapters, align_seq_len
 from hooks import MultiHookManager
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK, PRETRAINED_MODEL_DIR
 
 
 # =============================================================================
@@ -194,6 +195,32 @@ def load_student(cfg: DistillTrainPipelineConfig) -> PreTrainedPolicy:
 
     student.train()
     return student
+
+
+def resolve_resume_checkpoint_path(cfg: DistillTrainPipelineConfig) -> Path | None:
+    """Resolve the checkpoint root directory used for resume."""
+    if not cfg.resume:
+        return None
+
+    resume_ckpt = cfg.checkpoint_path or str(Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK)
+    resume_ckpt_path = Path(resume_ckpt)
+    if not resume_ckpt_path.exists():
+        raise FileNotFoundError(
+            f"resume=True 但未找到恢复检查点: {resume_ckpt_path}。"
+            f"可通过 --checkpoint_path 显式指定，或确认 {Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK} 存在。"
+        )
+
+    pretrained_dir = resume_ckpt_path / PRETRAINED_MODEL_DIR
+    if not pretrained_dir.is_dir():
+        if resume_ckpt_path.name == PRETRAINED_MODEL_DIR:
+            raise NotADirectoryError(
+                f"`checkpoint_path` 应指向 checkpoint 根目录，而不是 `{PRETRAINED_MODEL_DIR}` 子目录: {resume_ckpt_path}"
+            )
+        raise NotADirectoryError(
+            f"恢复检查点缺少 `{PRETRAINED_MODEL_DIR}` 目录: {pretrained_dir}"
+        )
+
+    return resume_ckpt_path
 
 
 def resolve_teacher_last_layer(
@@ -496,11 +523,24 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
 
+    resume_ckpt_path = resolve_resume_checkpoint_path(cfg)
+    student_pretrained_path = resume_ckpt_path / PRETRAINED_MODEL_DIR if resume_ckpt_path else Path(cfg.student_path)
+
+    if is_main:
+        logging.info(
+            f"Resume mode: {cfg.resume}, "
+            f"resume_ckpt={resume_ckpt_path if resume_ckpt_path else 'None'}, "
+            f"student_load_path={student_pretrained_path}"
+        )
+
     if cfg.policy is None:
-        cfg.policy = PreTrainedConfig.from_pretrained(cfg.student_path)
-        cfg.policy.pretrained_path = Path(cfg.student_path)
+        cfg.policy = PreTrainedConfig.from_pretrained(student_pretrained_path)
+        cfg.policy.pretrained_path = student_pretrained_path
         if is_main:
-            logging.info(f"Loaded policy config from student_path: {cfg.student_path}")
+            source = "resume checkpoint" if resume_ckpt_path else "student_path"
+            logging.info(f"Loaded policy config from {source}: {student_pretrained_path}")
+    elif resume_ckpt_path:
+        cfg.policy.pretrained_path = student_pretrained_path
 
     # WandB（仅主进程）
     if cfg.wandb.enable and cfg.wandb.project and is_main and WandBLogger is not None and cfg.policy is not None:
@@ -525,12 +565,15 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
     # ── 学生模型 ─────────────────────────────────────────────────────────────
     if is_main:
         logging.info("Loading student policy")
+    original_student_path = cfg.student_path
+    cfg.student_path = str(student_pretrained_path)
     student = load_student(cfg)
+    cfg.student_path = original_student_path
 
     # 预处理器
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=student.config,
-        pretrained_path=Path(cfg.student_path),
+        pretrained_path=student_pretrained_path,
         dataset_stats=dataset.meta.stats,
     )
 
@@ -597,15 +640,7 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
 
     # ── 断点恢复 ─────────────────────────────────────────────────────────────
     step = 0
-    if cfg.resume:
-        resume_ckpt = cfg.checkpoint_path or str(Path(cfg.output_dir) / "checkpoints" / "last")
-        resume_ckpt_path = Path(resume_ckpt)
-        if not resume_ckpt_path.exists():
-            raise FileNotFoundError(
-                f"resume=True 但未找到恢复检查点: {resume_ckpt_path}。"
-                "可通过 --checkpoint_path 显式指定，或确认 output_dir/checkpoints/last 存在。"
-            )
-
+    if resume_ckpt_path is not None:
         step, optimizer, lr_scheduler = load_training_state(
             resume_ckpt_path, optimizer, lr_scheduler
         )
