@@ -26,14 +26,18 @@ use_policy_training_preset: false
 distill:
   # 损失权重
   alpha_task: 1.0
-  alpha_distill: 0.5
-  alpha_feature: 0.4
-  alpha_logit: 0.6
+  alpha_distill: 0.2
+  alpha_vision_feature: 0.2
+  alpha_expert_feature: 0.0
+  alpha_logit: 0.0
   # 蒸馏开关
   feature_distill: true
-  logit_distill: true
-  # 冒烟测试默认从第 0 步就启用蒸馏，便于尽早暴露问题
-  warmup_steps: 0
+  vision_feature_distill: true
+  expert_feature_distill: false
+  logit_distill: false
+  # 冒烟测试保留最短 warmup，并快速进入 vision-only distill
+  warmup_steps: 1
+  distill_ramp_steps: 2
   temperature: 2.0
   # 教师模型
   teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model

@@ -27,14 +27,18 @@ use_policy_training_preset: false
 distill:
   # 损失权重
   alpha_task: 1.0
-  alpha_distill: 0.5
-  alpha_feature: 0.4
-  alpha_logit: 0.6
+  alpha_distill: 0.2
+  alpha_vision_feature: 0.2
+  alpha_expert_feature: 0.0
+  alpha_logit: 0.0
   # 蒸馏开关
   feature_distill: true
-  logit_distill: true
-  # 预热步数（前 N 步只用 task loss）
-  warmup_steps: 0
+  vision_feature_distill: true
+  expert_feature_distill: false
+  logit_distill: false
+  # 预热/爬坡步数（按 optimizer step 计）
+  warmup_steps: 250
+  distill_ramp_steps: 500
   temperature: 2.0
   # 教师模型
   teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model

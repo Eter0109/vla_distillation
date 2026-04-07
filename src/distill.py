@@ -19,6 +19,7 @@ VLA 蒸馏训练脚本（src/distill.py）
 
 import dataclasses
 import logging
+import math
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -65,7 +66,7 @@ from lerobot.utils.utils import (
 
 # 自定义蒸馏模块
 from adapters import DistillAdapters, align_seq_len
-from hooks import MultiHookManager
+from hooks import HookSpec, MultiHookManager
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.constants import CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK, PRETRAINED_MODEL_DIR
 
@@ -79,14 +80,19 @@ class DistillConfig:
     """蒸馏超参，作为 DistillTrainPipelineConfig 的子字段。"""
     # 损失权重
     alpha_task: float = 1.0
-    alpha_distill: float = 0.5
-    alpha_feature: float = 0.4
-    alpha_logit: float = 0.6
+    alpha_distill: float = 0.2
+    alpha_feature: float = 0.4  # 兼容旧配置；新配置请优先使用下方细分权重
+    alpha_vision_feature: float | None = None
+    alpha_expert_feature: float | None = None
+    alpha_logit: float = 0.0
     # 蒸馏开关
     feature_distill: bool = True
-    logit_distill: bool = True
-    # 预热：warmup 期间只用 task loss
-    warmup_steps: int = 500
+    vision_feature_distill: bool = True
+    expert_feature_distill: bool = False
+    logit_distill: bool = False
+    # 预热：warmup 期间只用 task loss；单位为 optimizer step
+    warmup_steps: int = 250
+    distill_ramp_steps: int = 500
     temperature: float = 2.0
     # 教师模型
     teacher_path: str = ""
@@ -99,6 +105,22 @@ class DistillConfig:
     teacher_expert_dim: int = 1024
     student_action_dim: int = 7
     teacher_action_dim: int = 20
+
+    @property
+    def vision_loss_weight(self) -> float:
+        return self.alpha_feature if self.alpha_vision_feature is None else self.alpha_vision_feature
+
+    @property
+    def expert_loss_weight(self) -> float:
+        return self.alpha_feature if self.alpha_expert_feature is None else self.alpha_expert_feature
+
+    @property
+    def enable_vision_distill(self) -> bool:
+        return self.feature_distill and self.vision_feature_distill
+
+    @property
+    def enable_expert_distill(self) -> bool:
+        return self.feature_distill and self.expert_feature_distill
 
 
 @dataclass
@@ -127,6 +149,36 @@ class DistillTrainPipelineConfig(TrainPipelineConfig):
     def __get_path_fields__(cls) -> list[str]:
         # 不走 policy 路径加载
         return []
+
+
+_WARNED_MESSAGES: set[str] = set()
+
+
+def log_warning_once(key: str, message: str) -> None:
+    if key in _WARNED_MESSAGES:
+        return
+    logging.warning(message)
+    _WARNED_MESSAGES.add(key)
+
+
+def compute_distill_scale(dc: DistillConfig, optimizer_step: int) -> float:
+    """Return a [0, 1] multiplier for distillation based on optimizer steps."""
+    if optimizer_step < dc.warmup_steps:
+        return 0.0
+    if dc.distill_ramp_steps <= 0:
+        return 1.0
+    post_warmup = optimizer_step - dc.warmup_steps + 1
+    return min(1.0, post_warmup / dc.distill_ramp_steps)
+
+
+def compute_grad_norm(parameters: list[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for param in parameters:
+        if param.grad is None:
+            continue
+        param_norm = param.grad.detach().float().norm(2)
+        total += float(param_norm.item() ** 2)
+    return math.sqrt(total)
 
 
 # =============================================================================
@@ -257,17 +309,10 @@ def extract_teacher_feature_targets(
     teacher_batch: dict,
     cfg: DistillTrainPipelineConfig,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, str, str]:
-    """Run XVLA encoder + transformer once to capture feature distillation targets."""
-    teacher_last_layer, teacher_last_layer_path = resolve_teacher_last_layer(teacher, cfg)
-    teacher_last_layer_type = type(teacher_last_layer).__name__
+    """Run XVLA encoder once to capture stable feature distillation targets."""
 
     t_inputs = teacher._build_model_inputs(teacher_batch)
     teacher_model = teacher.model
-    target_dtype = (
-        teacher_model._get_target_dtype()
-        if hasattr(teacher_model, "_get_target_dtype")
-        else t_inputs["image_input"].dtype
-    )
 
     enc = teacher_model.forward_vlm(
         input_ids=t_inputs["input_ids"],
@@ -275,30 +320,7 @@ def extract_teacher_feature_targets(
         image_mask=t_inputs["image_mask"],
     )
     t_vision = enc["vlm_features"].float()
-
-    batch_size = t_inputs["input_ids"].shape[0]
-    dummy_action = torch.zeros(
-        batch_size,
-        teacher_model.chunk_size,
-        teacher_model.dim_action,
-        device=t_inputs["input_ids"].device,
-        dtype=target_dtype,
-    )
-    t = torch.ones(batch_size, device=dummy_action.device, dtype=target_dtype)
-    proprio = t_inputs["proprio"].to(dtype=target_dtype)
-    proprio_m, action_with_noise = teacher_model.action_space.preprocess(proprio, dummy_action)
-
-    with MultiHookManager({"teacher_last": teacher_last_layer}) as t_hooks:
-        teacher_model.transformer(
-            domain_id=t_inputs["domain_id"],
-            action_with_noise=action_with_noise,
-            proprio=proprio_m,
-            t=t,
-            **enc,
-        )
-        t_last = t_hooks["teacher_last"].output
-
-    return t_vision, t_last.float() if t_last is not None else None, teacher_last_layer_path, teacher_last_layer_type
+    return t_vision, None, "", ""
 
 
 # =============================================================================
@@ -314,7 +336,8 @@ def update_distill(
     adapters: DistillAdapters,
     optimizer: Optimizer,
     grad_clip_norm: float,
-    step: int,
+    micro_step: int,
+    optimizer_step: int,
     cfg: DistillTrainPipelineConfig,
     accelerator: Accelerator,
     lr_scheduler=None,
@@ -327,42 +350,55 @@ def update_distill(
     """
     t0 = time.perf_counter()
     dc = cfg.distill
-    in_warmup = step < dc.warmup_steps
+    in_warmup = optimizer_step < dc.warmup_steps
+    distill_scale = compute_distill_scale(dc, optimizer_step)
+    enable_vision_distill = dc.enable_vision_distill
+    enable_expert_distill = dc.enable_expert_distill
+    enable_logit_distill = dc.logit_distill
     log = {}
     grad_norm = torch.tensor(0.0, device=accelerator.device)
+    student_grad_norm = 0.0
 
     student.train()
 
     student_vision_module = None
     student_model = student.module if hasattr(student, "module") else student
-    if dc.feature_distill:
+    if enable_vision_distill:
         student_vision_module = student_model.model.vlm_with_expert.vlm.model.connector
 
     with accelerator.accumulate(student, adapters):
-        with MultiHookManager({"student_vision": student_vision_module} if student_vision_module else {}) as s_hooks:
+        hook_specs = (
+            {
+                "student_vision": HookSpec(
+                    module=student_vision_module,
+                    detach=False,
+                    clone=False,
+                )
+            }
+            if student_vision_module
+            else {}
+        )
+        with MultiHookManager(hook_specs) as s_hooks:
             # ── 1. 学生任务损失（同时捕获 student features）──────────────────────
             with accelerator.autocast():
-                task_loss, student_out = student.forward(student_batch)
+                task_loss, _ = student.forward(student_batch)
                 task_loss = task_loss.float()
 
             # ── 2. 蒸馏损失 ─────────────────────────────────────────────────
-            distill_loss = torch.zeros(1, device=accelerator.device)
+            distill_loss = torch.zeros((), device=accelerator.device)
 
-            if not in_warmup and (dc.feature_distill or dc.logit_distill):
+            if distill_scale > 0 and (enable_vision_distill or enable_expert_distill or enable_logit_distill):
                 t_vision = None
-                t_last = None
                 t_action = None
-                teacher_last_layer_path = ""
-                teacher_last_layer_type = ""
 
                 if teacher is not None and teacher_batch is not None:
                     teacher_dtype = getattr(teacher.model, "_get_target_dtype", lambda: torch.float16)()
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=teacher_dtype):
-                        if dc.feature_distill:
-                            t_vision, t_last, teacher_last_layer_path, teacher_last_layer_type = (
+                        if enable_vision_distill:
+                            t_vision, _, _, _ = (
                                 extract_teacher_feature_targets(teacher, teacher_batch, cfg)
                             )
-                        if dc.logit_distill:
+                        if enable_logit_distill:
                             t_inputs = teacher._build_model_inputs(teacher_batch)
                             t_action = teacher.model.generate_actions(
                                 input_ids=t_inputs["input_ids"],
@@ -373,73 +409,64 @@ def update_distill(
                                 steps=teacher.config.num_denoising_steps,
                             ).float()
 
-                if dc.feature_distill:
-                    dev = accelerator.device
+                if enable_vision_distill or enable_expert_distill:
                     vlm_with_expert = student_model.model.vlm_with_expert
                     se_cached = vlm_with_expert._last_expert_output
                     sv_raw = s_hooks["student_vision"].output if student_vision_module else None
                     sv = sv_raw.float() if sv_raw is not None else None
-                    if step == 0 and accelerator.is_main_process:
+                    if micro_step == 0 and accelerator.is_main_process:
                         logging.info(
                             f"[DEBUG] feature shapes: "
                             f"student_vision={tuple(sv.shape) if sv is not None else None} "
                             f"teacher_vision={tuple(t_vision.shape) if t_vision is not None else None} "
                             f"student_expert={tuple(se_cached.shape) if se_cached is not None else None} "
-                            f"teacher_last={tuple(t_last.shape) if t_last is not None else None}"
+                            f"teacher_last=None"
                         )
-                        if t_last is None and teacher_last_layer_path:
-                            logging.info(
-                                f"[DEBUG] teacher_last unresolved: path={teacher_last_layer_path} "
-                                f"type={teacher_last_layer_type or 'unknown'}"
+                    if enable_vision_distill:
+                        if sv is None or t_vision is None:
+                            log_warning_once(
+                                "vision_distill_missing_features",
+                                "vision_feature_distill=True 但 student_vision 或 teacher_vision 为 None，跳过 vision 特征蒸馏。",
                             )
-                    if sv is None or t_vision is None:
-                        logging.warning(
-                            "feature_distill=True 但 student_vision 或 teacher_vision 为 None，跳过 vision 特征蒸馏本步"
-                        )
-                    else:
-                        sv = align_seq_len(sv, t_vision)
-                        sv_proj = adapters.adapt_vision(sv)
-                        loss_vis = F.mse_loss(sv_proj, t_vision.detach())
-                        distill_loss = distill_loss + dc.alpha_feature * loss_vis
-                        log["loss_vision_feat"] = loss_vis.item()
+                        else:
+                            sv = align_seq_len(sv, t_vision)
+                            sv_proj = adapters.adapt_vision(sv)
+                            loss_vis = F.mse_loss(sv_proj, t_vision.detach())
+                            distill_loss = distill_loss + dc.vision_loss_weight * loss_vis
+                            log["loss_vision_feat"] = loss_vis.item()
 
-                    if se_cached is None or t_last is None:
-                        warning = (
-                            "feature_distill=True 但 student_expert 或 teacher_last 为 None，"
-                            "跳过 expert 特征蒸馏本步"
+                    if enable_expert_distill:
+                        log_warning_once(
+                            "expert_distill_disabled",
+                            "expert_feature_distill 已暂时停用：当前 teacher expert target 仍依赖 dummy_action/t=1，不再参与训练。",
                         )
-                        if t_last is None and teacher_last_layer_path:
-                            warning += (
-                                f" (resolved layer: {teacher_last_layer_path}, "
-                                f"type={teacher_last_layer_type or 'unknown'})"
-                            )
-                        logging.warning(warning)
-                    else:
-                        se = se_cached.to(dev).float()
-                        se = align_seq_len(se, t_last)
-                        se_proj = adapters.adapt_expert(se)
-                        loss_exp = F.mse_loss(se_proj, t_last.detach())
-                        distill_loss = distill_loss + dc.alpha_feature * loss_exp
-                        log["loss_expert_feat"] = loss_exp.item()
 
-                if dc.logit_distill:
-                    with torch.no_grad(), accelerator.autocast():
+                if enable_logit_distill:
+                    with accelerator.autocast():
                         images, img_masks = student_model.prepare_images(student_batch)
                         state = student_model.prepare_state(student_batch)
                         lang_tokens = student_batch[f"{OBS_LANGUAGE_TOKENS}"]
                         lang_masks = student_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
                         student_pred_action = student_model.model.sample_actions(
                             images, img_masks, lang_tokens, lang_masks, state
-                        ).detach()
+                        )
                         student_pred_action = student_pred_action[..., : dc.student_action_dim]
-                        if step == 0 and accelerator.is_main_process:
+                        if micro_step == 0 and accelerator.is_main_process:
                             logging.info(
                                 f"[DEBUG] action shapes: "
                                 f"student_action={tuple(student_pred_action.shape)} teacher_action={tuple(t_action.shape) if t_action is not None else None}"
                             )
 
                     if t_action is None:
-                        logging.warning("logit_distill=True 但 teacher_action 为 None，跳过 logit 蒸馏本步")
+                        log_warning_once(
+                            "logit_distill_missing_teacher",
+                            "logit_distill=True 但 teacher_action 为 None，跳过 logit 蒸馏。",
+                        )
+                    elif not student_pred_action.requires_grad:
+                        log_warning_once(
+                            "logit_distill_nondiff_student",
+                            "student sample_actions() 当前不可微，已跳过 logit distill；如需启用，请切换到可微动作输出接口。",
+                        )
                     else:
                         s_act = student_pred_action.float()
                         min_T = min(s_act.shape[1], t_action.shape[1])
@@ -456,7 +483,7 @@ def update_distill(
                         log["loss_kl_action"] = loss_kl.item()
 
             # ── 3. 总损失 ────────────────────────────────────────────────────
-            total_loss = dc.alpha_task * task_loss + dc.alpha_distill * distill_loss
+            total_loss = dc.alpha_task * task_loss + (dc.alpha_distill * distill_scale) * distill_loss
 
             # ── 4. 反向 ─────────────────────────────────────────────────────
             accelerator.backward(total_loss)
@@ -469,6 +496,7 @@ def update_distill(
 
             # ── 5. 梯度裁剪 + 优化器步进（仅在累积边界执行）──────────────────
             if accelerator.sync_gradients:
+                student_grad_norm = compute_grad_norm([p for p in student.parameters() if p.requires_grad])
                 if grad_clip_norm > 0:
                     grad_norm = accelerator.clip_grad_norm_(
                         list(student.parameters()) + list(adapters.parameters()),
@@ -487,7 +515,12 @@ def update_distill(
     log.update({
         "loss_task": task_loss.item(),
         "loss_distill": distill_loss.item(),
+        "distill_scale": distill_scale,
         "in_warmup": float(in_warmup),
+        "micro_step": float(micro_step + 1),
+        "optimizer_step": float(optimizer_step + int(accelerator.sync_gradients)),
+        "optimizer_step_applied": float(accelerator.sync_gradients),
+        "student_grad_norm": student_grad_norm,
     })
 
     train_metrics.loss = total_loss.item()
@@ -599,7 +632,8 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         teacher_expert_dim=dc.teacher_expert_dim,
         student_action_dim=dc.student_action_dim,
         teacher_action_dim=dc.teacher_action_dim,
-        enable_feature_distill=dc.feature_distill,
+        enable_vision_distill=dc.enable_vision_distill,
+        enable_expert_distill=dc.enable_expert_distill,
         enable_logit_distill=dc.logit_distill,
     ).to(device)
 
@@ -607,20 +641,20 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
     if is_main:
         logging.info("Creating optimizer and scheduler")
 
-    all_params = [
-        {"params": [p for p in student.parameters() if p.requires_grad]},
-        {"params": list(adapters.parameters())},
-    ]
+    student_params = [p for p in student.parameters() if p.requires_grad]
+    adapter_params = list(adapters.parameters())
+    all_params = [{"params": student_params}]
+    if adapter_params:
+        all_params.append({"params": adapter_params})
 
     # 使用 student policy 自带的 training preset（若存在）
     if cfg.use_policy_training_preset and hasattr(student, "get_optimizer_preset"):
         from lerobot.optim.factory import make_optimizer_and_scheduler
         optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, student)
         # 追加 adapters 参数组
-        for p in adapters.parameters():
-            optimizer.add_param_group({"params": p})
+        if adapter_params:
+            optimizer.add_param_group({"params": adapter_params})
     else:
-        import math
         from torch.optim.lr_scheduler import LambdaLR
         opt_cfg = cfg.optimizer
         lr = opt_cfg.lr if opt_cfg else 1e-4
@@ -659,7 +693,9 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         effective_bs = cfg.batch_size * accelerator.num_processes * cfg.grad_accum_steps
+        total_optimizer_steps = math.ceil(cfg.steps / max(1, cfg.grad_accum_steps))
         logging.info(f"Effective batch size: {cfg.batch_size} x {accelerator.num_processes} x {cfg.grad_accum_steps} = {effective_bs}")
+        logging.info(f"Approx optimizer steps: {total_optimizer_steps}")
         logging.info(f"{num_learnable=} ({format_big_number(num_learnable)})")
         logging.info(f"{num_total=} ({format_big_number(num_total)})")
 
@@ -713,6 +749,11 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         initial_step=step,
         accelerator=accelerator,
     )
+    optimizer_step = step // max(1, cfg.grad_accum_steps)
+    task_loss_interval_sum = 0.0
+    task_loss_interval_count = 0
+    task_loss_ema: float | None = None
+    task_loss_ema_beta = 0.98
 
     if is_main:
         progbar = tqdm(
@@ -725,8 +766,9 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         )
         logging.info(
             colored(
-                f"开始蒸馏训练，共 {cfg.steps} 步，"
-                f"feature_distill={dc.feature_distill}，"
+                f"开始蒸馏训练，共 {cfg.steps} 个 micro step，"
+                f"vision_distill={dc.enable_vision_distill}，"
+                f"expert_distill={dc.enable_expert_distill}，"
                 f"logit_distill={dc.logit_distill}",
                 "green",
                 attrs=["bold"],
@@ -750,13 +792,23 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
             adapters=adapters,
             optimizer=optimizer,
             grad_clip_norm=cfg.optimizer.grad_clip_norm if cfg.optimizer else 10.0,
-            step=step,
+            micro_step=step,
+            optimizer_step=optimizer_step,
             cfg=cfg,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
         )
 
+        raw_task_loss = output_dict["loss_task"]
+        task_loss_interval_sum += raw_task_loss
+        task_loss_interval_count += 1
+        if task_loss_ema is None:
+            task_loss_ema = raw_task_loss
+        else:
+            task_loss_ema = task_loss_ema_beta * task_loss_ema + (1 - task_loss_ema_beta) * raw_task_loss
+
         step += 1
+        optimizer_step += int(output_dict.get("optimizer_step_applied", 0.0))
         if is_main:
             progbar.update(1)
         train_tracker.step()
@@ -767,12 +819,29 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         # 日志
         if is_log_step:
             logging.info(train_tracker)
+            task_loss_avg = task_loss_interval_sum / max(1, task_loss_interval_count)
+            logging.info(
+                "distill stats: "
+                f"micro_step={step} optimizer_step={optimizer_step} "
+                f"loss_task_raw={raw_task_loss:.4f} "
+                f"loss_task_avg={task_loss_avg:.4f} "
+                f"loss_task_ema={task_loss_ema:.4f} "
+                f"distill_scale={output_dict.get('distill_scale', 0.0):.3f}"
+            )
             if wandb_logger:
                 wandb_log = train_tracker.to_dict()
                 if output_dict:
                     wandb_log.update({f"distill/{k}": v for k, v in output_dict.items()})
+                wandb_log.update({
+                    "distill/loss_task_avg": task_loss_avg,
+                    "distill/loss_task_ema": task_loss_ema,
+                    "distill/micro_step": float(step),
+                    "distill/optimizer_step": float(optimizer_step),
+                })
                 wandb_logger.log_dict(wandb_log, step)
             train_tracker.reset_averages()
+            task_loss_interval_sum = 0.0
+            task_loss_interval_count = 0
 
         # 保存检查点
         if cfg.save_checkpoint and is_saving_step:

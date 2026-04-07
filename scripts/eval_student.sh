@@ -27,7 +27,7 @@ conda activate lerobot
 # =============================================================================
 # 路径配置
 # =============================================================================
-PROJECT_ROOT="/hqlab/workspace/zhaozy/vla_distillation"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="${PROJECT_ROOT}/src"
 LEROBOT_ROOT="/hqlab/workspace/zhaozy/lerobot/src"
 
@@ -68,7 +68,7 @@ done
 # =============================================================================
 # 自动寻找最新检查点
 # =============================================================================
-CKPT_BASE_DIR="${PROJECT_ROOT}/outputs/checkpoints"
+CKPT_BASE_DIR="${PROJECT_ROOT}/outputs/distill/checkpoints"
 
 if [[ -z "${CKPT_PATH}" ]]; then
     # 优先 step_XXXXXXX（按步数降序取最新），其次 best
@@ -183,7 +183,7 @@ PYEOF
 if python -c "import gymnasium; import lerobot.envs" 2>/dev/null; then
     eval_lerobot
 else
-    echo "未检测到 gymnasium / libero gym，回退至模型加载验证模式。"
+    echo "未检测到 gymnasium / libero gym，回退至模型加载验证模式（不包含真实 LIBERO 成功率）。"
     eval_wrapper
 fi
 

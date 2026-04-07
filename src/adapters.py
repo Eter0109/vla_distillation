@@ -84,8 +84,8 @@ class ActionAdapter(FeatureProjector):
 class DistillAdapters(nn.Module):
     """蒸馏适配层集合，统一管理所有对齐层。
 
-    可根据配置文件的开关（enable_feature_distill / enable_logit_distill）
-    决定哪些适配器需要参与梯度计算。
+    可根据配置文件的开关（enable_vision_distill / enable_expert_distill /
+    enable_logit_distill）决定哪些适配器需要参与梯度计算。
     """
 
     def __init__(
@@ -96,15 +96,18 @@ class DistillAdapters(nn.Module):
         teacher_expert_dim: int = 1024,
         student_action_dim: int = 7,
         teacher_action_dim: int = 20,
-        enable_feature_distill: bool = True,
+        enable_vision_distill: bool = True,
+        enable_expert_distill: bool = False,
         enable_logit_distill: bool = True,
     ):
         super().__init__()
-        self.enable_feature_distill = enable_feature_distill
+        self.enable_vision_distill = enable_vision_distill
+        self.enable_expert_distill = enable_expert_distill
         self.enable_logit_distill = enable_logit_distill
 
-        if enable_feature_distill:
+        if enable_vision_distill:
             self.vision_adapter = VisionFeatureAdapter(student_vision_dim, teacher_vision_dim)
+        if enable_expert_distill:
             self.expert_adapter = ActionExpertFeatureAdapter(student_expert_dim, teacher_expert_dim)
 
         if enable_logit_distill:
@@ -112,12 +115,12 @@ class DistillAdapters(nn.Module):
 
     def adapt_vision(self, student_feat: torch.Tensor) -> torch.Tensor:
         """将学生视觉特征投影到教师维度。"""
-        assert self.enable_feature_distill, "feature distill未启用"
+        assert self.enable_vision_distill, "vision distill未启用"
         return self.vision_adapter(student_feat)
 
     def adapt_expert(self, student_feat: torch.Tensor) -> torch.Tensor:
         """将学生 lm_expert 特征投影到教师维度。"""
-        assert self.enable_feature_distill, "feature distill未启用"
+        assert self.enable_expert_distill, "expert distill未启用"
         return self.expert_adapter(student_feat)
 
     def adapt_action(self, student_action: torch.Tensor) -> torch.Tensor:
