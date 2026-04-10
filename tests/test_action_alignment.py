@@ -84,12 +84,45 @@ def test_teacher_abs20_to_student_rel7_geometry():
     torch.testing.assert_close(rel, expected, rtol=0.0, atol=2e-4)
 
 
+def test_teacher_abs20_to_student_rel7_geometry_with_state8_axis_angle():
+    state = torch.zeros(1, 8, dtype=torch.float32)
+    action = torch.zeros(1, 20, dtype=torch.float32)
+
+    # current pose from 8D state: pos(3) + axis-angle(3) + extra(2)
+    state[:, :3] = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    state[:, 3:6] = torch.tensor([[0.0, 0.0, math.pi / 4.0]], dtype=torch.float32)
+    state[:, 6:] = torch.tensor([[0.12, -0.34]], dtype=torch.float32)
+
+    # target pose from teacher action: pos + rot6d + gripper
+    action[:, :3] = torch.tensor([[1.1, 1.8, 3.3]], dtype=torch.float32)
+    action[:, 3:9] = _rot6d_from_matrix(_rotz(math.pi / 2.0).unsqueeze(0))
+    action[:, 9:10] = torch.tensor([[0.75]], dtype=torch.float32)
+
+    rel = xvla_teacher_action20_to_student_rel7(action, teacher_state=state)
+    expected = torch.tensor([[0.1, -0.2, 0.3, 0.0, 0.0, math.pi / 4.0, 0.5]], dtype=torch.float32)
+    torch.testing.assert_close(rel, expected, rtol=0.0, atol=2e-4)
+
+
 def test_teacher_abs20_to_student_rel7_supports_bt_and_bd():
     torch.manual_seed(0)
     teacher_action_bt = torch.randn(3, 4, 20, dtype=torch.float32)
     teacher_state_bd = torch.randn(3, 20, dtype=torch.float32)
     teacher_action_bd = torch.randn(5, 20, dtype=torch.float32)
     teacher_state_bd_2 = torch.randn(5, 20, dtype=torch.float32)
+
+    out_bt = xvla_teacher_action20_to_student_rel7(teacher_action_bt, teacher_state=teacher_state_bd)
+    out_bd = xvla_teacher_action20_to_student_rel7(teacher_action_bd, teacher_state=teacher_state_bd_2)
+
+    assert out_bt.shape == (3, 4, 7)
+    assert out_bd.shape == (5, 7)
+
+
+def test_teacher_abs20_to_student_rel7_supports_state8_bt_and_bd():
+    torch.manual_seed(1)
+    teacher_action_bt = torch.randn(3, 4, 20, dtype=torch.float32)
+    teacher_state_bd = torch.randn(3, 8, dtype=torch.float32)
+    teacher_action_bd = torch.randn(5, 20, dtype=torch.float32)
+    teacher_state_bd_2 = torch.randn(5, 8, dtype=torch.float32)
 
     out_bt = xvla_teacher_action20_to_student_rel7(teacher_action_bt, teacher_state=teacher_state_bd)
     out_bd = xvla_teacher_action20_to_student_rel7(teacher_action_bd, teacher_state=teacher_state_bd_2)

@@ -129,6 +129,35 @@ def _rotation_matrix_to_axis_angle_torch(rotation_matrix: torch.Tensor) -> torch
     return torch.from_numpy(axis_angle).to(device=rotation_matrix.device, dtype=rotation_matrix.dtype)
 
 
+def _axis_angle_to_rotation_matrix_torch(axis_angle: torch.Tensor) -> torch.Tensor:
+    """将 axis-angle（..., 3）转换为旋转矩阵（..., 3, 3）。"""
+    if axis_angle.shape[-1] != 3:
+        raise ValueError(f"Expected last dim=3 for axis_angle, got {axis_angle.shape[-1]}")
+
+    theta = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
+    axis = axis_angle / torch.clamp(theta, min=1e-8)
+
+    kx = axis[..., 0]
+    ky = axis[..., 1]
+    kz = axis[..., 2]
+    zeros = torch.zeros_like(kx)
+
+    k = torch.stack(
+        [
+            torch.stack([zeros, -kz, ky], dim=-1),
+            torch.stack([kz, zeros, -kx], dim=-1),
+            torch.stack([-ky, kx, zeros], dim=-1),
+        ],
+        dim=-2,
+    )
+
+    eye = torch.eye(3, device=axis_angle.device, dtype=axis_angle.dtype)
+    eye = eye.expand(*axis_angle.shape[:-1], 3, 3)
+    sin_t = torch.sin(theta)[..., 0][..., None, None]
+    cos_t = torch.cos(theta)[..., 0][..., None, None]
+    return eye + sin_t * k + (1.0 - cos_t) * (k @ k)
+
+
 def _validate_action_input(action: torch.Tensor, min_dim: int, *, name: str) -> None:
     if action.ndim < 2:
         raise ValueError(f"Expected {name} ndim >= 2, got shape={tuple(action.shape)}")
@@ -171,7 +200,7 @@ def _prepare_teacher_state_for_action(
 ) -> torch.Tensor:
     """将 teacher state 对齐到 teacher action 的 batch/time 结构。"""
     _validate_action_input(teacher_action, min_dim=10, name="teacher_action")
-    _validate_action_input(teacher_state, min_dim=10, name="teacher_state")
+    _validate_action_input(teacher_state, min_dim=6, name="teacher_state")
     teacher_state = teacher_state.to(device=teacher_action.device, dtype=teacher_action.dtype)
 
     # 训练中常见形状是 (B, D) 或 (B, T_obs, D)。对于后者取当前时刻（最后一帧）。
@@ -205,6 +234,27 @@ def _prepare_teacher_state_for_action(
     )
 
 
+def _extract_current_pose_from_teacher_state(teacher_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """从 teacher state 提取当前位置与当前旋转矩阵。
+
+    支持两类 state 语义：
+      - state_dim >= 9: [pos(3), rot6d(6), ...]
+      - 6 <= state_dim < 9: [pos(3), axis-angle(3), ...]（例如 LIBERO 常见 8D）
+    """
+    if teacher_state.shape[-1] < 6:
+        raise ValueError(
+            "teacher_state must contain at least position(3)+orientation(3), "
+            f"got last dim={teacher_state.shape[-1]}"
+        )
+
+    current_pos = teacher_state[:, :3]
+    if teacher_state.shape[-1] >= 9:
+        current_rot = _rotate6d_to_matrix_torch(teacher_state[:, 3:9])
+    else:
+        current_rot = _axis_angle_to_rotation_matrix_torch(teacher_state[:, 3:6])
+    return current_pos, current_rot
+
+
 def xvla_teacher_action20_to_student_rel7(
     teacher_action: torch.Tensor,
     *,
@@ -214,7 +264,9 @@ def xvla_teacher_action20_to_student_rel7(
 
     规则（teacher_abs20_to_student_rel7）：
       1) 从 teacher action 取 target_pos/target_rot6d/gripper（前10维）
-      2) 从 teacher state 取 current_pos/current_rot6d（前9维）
+      2) 从 teacher state 取 current pose：
+         - state_dim>=9: pos+rot6d
+         - 6<=state_dim<9: pos+axis-angle
       3) delta_pos = target_pos - current_pos
       4) delta_rot = axis_angle(R_target * R_current^{-1})
       5) gripper: [0, 1] -> [-1, 1] 并 clamp
@@ -228,12 +280,10 @@ def xvla_teacher_action20_to_student_rel7(
     target_rot6d = action_flat[:, 3:9]
     target_gripper = action_flat[:, 9:10]
 
-    current_pos = state_flat[:, :3]
-    current_rot6d = state_flat[:, 3:9]
+    current_pos, current_rot = _extract_current_pose_from_teacher_state(state_flat)
 
     delta_pos = target_pos - current_pos
     target_rot = _rotate6d_to_matrix_torch(target_rot6d)
-    current_rot = _rotate6d_to_matrix_torch(current_rot6d)
     delta_rot_mat = torch.matmul(target_rot, current_rot.transpose(-1, -2))
     delta_rot = _rotation_matrix_to_axis_angle_torch(delta_rot_mat)
 
