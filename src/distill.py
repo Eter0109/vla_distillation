@@ -94,6 +94,7 @@ class DistillConfig:
     warmup_steps: int = 250
     distill_ramp_steps: int = 500
     temperature: float = 2.0
+    action_distill_loss: str = "mse"  # mse | smooth_l1 | kl
     # 教师模型
     teacher_path: str = ""
     teacher_dtype: str = "float16"
@@ -105,7 +106,7 @@ class DistillConfig:
     teacher_expert_dim: int = 1024
     student_action_dim: int = 7
     teacher_action_dim: int = 20
-    action_align_mode: str = "xvla_libero_20to7"
+    action_align_mode: str = "teacher_abs20_to_student_rel7"
 
     @property
     def vision_loss_weight(self) -> float:
@@ -474,15 +475,41 @@ def update_distill(
                         s_act = s_act[:, :min_T, :]
                         t_act = t_action[:, :min_T, : dc.teacher_action_dim].float()
                         s_act_aligned = adapters.adapt_student_action(s_act)
-                        t_act_aligned = adapters.adapt_teacher_action(t_act)
-                        T = dc.temperature
-                        loss_kl = F.kl_div(
-                            F.log_softmax(s_act_aligned / T, dim=-1),
-                            F.softmax(t_act_aligned.detach() / T, dim=-1),
-                            reduction="batchmean",
-                        ) * (T ** 2)
-                        distill_loss = distill_loss + dc.alpha_logit * loss_kl
-                        log["loss_kl_action"] = loss_kl.item()
+                        teacher_state = teacher_batch.get(OBS_STATE) if teacher_batch is not None else None
+                        t_act_aligned = adapters.adapt_teacher_action(
+                            t_act,
+                            teacher_state=teacher_state,
+                        )
+                        loss_type = dc.action_distill_loss.strip().lower()
+                        if loss_type == "mse":
+                            log_warning_once(
+                                "action_distill_temperature_ignored",
+                                "action_distill_loss!=kl 时 temperature 参数会被忽略。",
+                            )
+                            loss_action = F.mse_loss(s_act_aligned, t_act_aligned.detach())
+                        elif loss_type == "smooth_l1":
+                            log_warning_once(
+                                "action_distill_temperature_ignored",
+                                "action_distill_loss!=kl 时 temperature 参数会被忽略。",
+                            )
+                            loss_action = F.smooth_l1_loss(s_act_aligned, t_act_aligned.detach())
+                        elif loss_type == "kl":
+                            t = dc.temperature
+                            loss_action = F.kl_div(
+                                F.log_softmax(s_act_aligned / t, dim=-1),
+                                F.softmax(t_act_aligned.detach() / t, dim=-1),
+                                reduction="batchmean",
+                            ) * (t ** 2)
+                        else:
+                            raise ValueError(
+                                "Unsupported distill.action_distill_loss="
+                                f"{dc.action_distill_loss}. Expected one of: mse, smooth_l1, kl."
+                            )
+
+                        distill_loss = distill_loss + dc.alpha_logit * loss_action
+                        log["loss_action_distill"] = loss_action.item()
+                        # 0: mse, 1: smooth_l1, 2: kl
+                        log["action_distill_loss_type"] = {"mse": 0.0, "smooth_l1": 1.0, "kl": 2.0}[loss_type]
 
             # ── 3. 总损失 ────────────────────────────────────────────────────
             total_loss = dc.alpha_task * task_loss + (dc.alpha_distill * distill_scale) * distill_loss
@@ -627,6 +654,9 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
 
     # ── 适配层 ───────────────────────────────────────────────────────────────
     dc = cfg.distill
+    student_norm_map = getattr(student.config, "normalization_mapping", {}) or {}
+    student_action_norm_mode = student_norm_map.get("ACTION", "IDENTITY")
+    student_action_stats = dataset.meta.stats.get(ACTION) if getattr(dataset.meta, "stats", None) else None
     adapters = DistillAdapters(
         student_vision_dim=dc.student_vision_dim,
         teacher_vision_dim=dc.teacher_vision_dim,
@@ -635,6 +665,8 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         student_action_dim=dc.student_action_dim,
         teacher_action_dim=dc.teacher_action_dim,
         action_align_mode=dc.action_align_mode,
+        student_action_stats=student_action_stats,
+        student_action_norm_mode=student_action_norm_mode,
         enable_vision_distill=dc.enable_vision_distill,
         enable_expert_distill=dc.enable_expert_distill,
         enable_logit_distill=dc.logit_distill,
@@ -772,7 +804,9 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
                 f"开始蒸馏训练，共 {cfg.steps} 个 micro step，"
                 f"vision_distill={dc.enable_vision_distill}，"
                 f"expert_distill={dc.enable_expert_distill}，"
-                f"logit_distill={dc.logit_distill}",
+                f"logit_distill={dc.logit_distill}，"
+                f"action_align_mode={dc.action_align_mode}，"
+                f"action_distill_loss={dc.action_distill_loss}",
                 "green",
                 attrs=["bold"],
             )

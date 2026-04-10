@@ -113,15 +113,16 @@ total_loss = alpha_task × MSE(student_action, GT_action)
            + alpha_distill × distill_scale × (
                  alpha_vision_feature × vision_feat_loss
                + alpha_expert_feature × expert_feat_loss
-               + alpha_logit × kl_loss
+               + alpha_logit × action_distill_loss
              )
 ```
 
 - **任务损失**：学生预测动作与真实动作的 MSE（flow matching loss）
 - **视觉蒸馏**：学生/教师视觉特征经投影后做 MSE，梯度直接回传到学生视觉主干
 - **Expert 蒸馏**：当前默认关闭；在 teacher 真实决策路径 hidden state 对齐前，不再使用 dummy target
-- **Logit 蒸馏**：学生动作为 7D；教师动作先按 XVLA LIBERO 评测同款规则
-  `20→7`（`eef[:3] + rot6d[3:9]→axis-angle(3) + gripper[9]二值化`）后，再计算 KL 散度
+- **动作蒸馏（logit_distill 分支）**：蒸馏空间固定为 student 7D。默认先将 teacher `20D` 转成
+  `abs7`，再结合 `teacher 当前 state` 做 `abs7→rel7`（`Δpos + Δrot(axis-angle) + gripper`），最后按
+  student 的 action normalization 统计映射到训练尺度；损失默认 `MSE`，可切 `SmoothL1`/`KL`
 
 `distill/loss_task` 记录的是单个 micro-batch 的原始值，曲线会天然较抖；分析训练趋势时请结合 `distill/loss_task_avg` / `distill/loss_task_ema`，并优先按 `distill/optimizer_step` 对齐不同实验。
 
@@ -133,7 +134,7 @@ total_loss = alpha_task × MSE(student_action, GT_action)
 |------|---------|---------|--------|
 | 视觉特征 (SigLIP → Florence2) | 576 | 1024 | `VisionFeatureAdapter` |
 | Action Expert 最后层 | 288 | 1024 | `ActionExpertFeatureAdapter` |
-| 预测动作（蒸馏空间） | 7 | 7（由 teacher 20D 对齐得到） | `ActionAdapter` |
+| 预测动作（蒸馏空间） | 7 | 7（teacher 20D 对齐到 student 7D 语义） | `ActionAdapter` |
 
 所有对齐层定义在 `src/adapters.py`，**不修改 lerobot 源码**。
 
@@ -171,8 +172,9 @@ torchrun --nproc_per_node=4 src/distill.py --config configs/distill_config.yaml
 | `alpha_logit` | 0.0 | Logit 蒸馏子权重（当前默认关闭） |
 | `warmup_steps` | 250 | 仅任务损失的预热步数，按 optimizer step 计 |
 | `distill_ramp_steps` | 500 | 蒸馏权重从 0 逐步升到 1 的 optimizer step 数 |
-| `temperature` | 2.0 | KL 蒸馏温度系数 |
-| `action_align_mode` | `xvla_libero_20to7` | 动作对齐模式（默认使用 XVLA LIBERO 评测同款 20→7 转换） |
+| `temperature` | 2.0 | 仅在 `action_distill_loss=kl` 时生效 |
+| `action_distill_loss` | `mse` | 动作蒸馏损失类型：`mse` / `smooth_l1` / `kl` |
+| `action_align_mode` | `teacher_abs20_to_student_rel7` | 动作对齐模式（默认 teacher 20D 对齐到 student 7D 语义；保留 `xvla_libero_20to7` 兼容模式） |
 | `teacher_transformer_last_layer_attr` | `blocks` | 教师 transformer 最后一层容器名，默认解析 `teacher.model.transformer.blocks[-1]` |
 | `total_steps` | 30000 | 总训练步数 |
 | `batch_size` | 8 | 每卡 batch size |

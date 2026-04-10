@@ -40,6 +40,7 @@ distill:
   warmup_steps: 250
   distill_ramp_steps: 500
   temperature: 2.0
+  action_distill_loss: mse
   # 教师模型
   teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model
   teacher_dtype: float16
@@ -51,7 +52,7 @@ distill:
   teacher_expert_dim: 1024
   student_action_dim: 7
   teacher_action_dim: 20
-  action_align_mode: xvla_libero_20to7
+  action_align_mode: teacher_abs20_to_student_rel7
 
 # ── 输出路径 ─────────────────────────────────────────────────
 output_dir: outputs/distill
