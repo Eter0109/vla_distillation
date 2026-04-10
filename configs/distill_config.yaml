@@ -4,14 +4,14 @@
 # ============================================================
 
 # ── 训练循环（对应 TrainPipelineConfig 顶层字段）────────────
-batch_size: 2
-steps: 1000
+batch_size: 4
+steps: 300000
 log_freq: 50
 save_freq: 200
 num_workers: 4
 seed: 42
 save_checkpoint: true
-grad_accum_steps: 16        # 梯度累积（DistillTrainPipelineConfig 扩展字段）
+grad_accum_steps: 32        # 梯度累积（DistillTrainPipelineConfig 扩展字段）
 student_path: /hqlab/workspace/zhaozy/models/smolvla_libero
 
 # ── 数据集（DatasetConfig）──────────────────────────────────
@@ -28,16 +28,16 @@ distill:
   # 损失权重
   alpha_task: 1.0
   alpha_distill: 0.2
-  alpha_vision_feature: 0.2
+  alpha_vision_feature: 0.0
   alpha_expert_feature: 0.0
-  alpha_logit: 0.0
+  alpha_logit: 1.0
   # 蒸馏开关
-  feature_distill: true
-  vision_feature_distill: true
+  feature_distill: false
+  vision_feature_distill: false
   expert_feature_distill: false
-  logit_distill: false
+  logit_distill: true
   # 预热/爬坡步数（按 optimizer step 计）
-  warmup_steps: 250
+  warmup_steps: 0
   distill_ramp_steps: 500
   temperature: 2.0
   action_distill_loss: mse
@@ -55,7 +55,7 @@ distill:
   action_align_mode: teacher_abs20_to_student_rel7
 
 # ── 输出路径 ─────────────────────────────────────────────────
-output_dir: outputs/distill
+output_dir: outputs/action_only_4_10
 
 # ── WandB（WandBConfig）──────────────────────────────────────
 wandb:
