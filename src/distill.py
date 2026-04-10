@@ -105,6 +105,7 @@ class DistillConfig:
     teacher_expert_dim: int = 1024
     student_action_dim: int = 7
     teacher_action_dim: int = 20
+    action_align_mode: str = "xvla_libero_20to7"
 
     @property
     def vision_loss_weight(self) -> float:
@@ -471,12 +472,13 @@ def update_distill(
                         s_act = student_pred_action.float()
                         min_T = min(s_act.shape[1], t_action.shape[1])
                         s_act = s_act[:, :min_T, :]
-                        t_act = t_action[:, :min_T, : dc.teacher_action_dim]
-                        s_act_proj = adapters.adapt_action(s_act)
+                        t_act = t_action[:, :min_T, : dc.teacher_action_dim].float()
+                        s_act_aligned = adapters.adapt_student_action(s_act)
+                        t_act_aligned = adapters.adapt_teacher_action(t_act)
                         T = dc.temperature
                         loss_kl = F.kl_div(
-                            F.log_softmax(s_act_proj / T, dim=-1),
-                            F.softmax(t_act.detach() / T, dim=-1),
+                            F.log_softmax(s_act_aligned / T, dim=-1),
+                            F.softmax(t_act_aligned.detach() / T, dim=-1),
                             reduction="batchmean",
                         ) * (T ** 2)
                         distill_loss = distill_loss + dc.alpha_logit * loss_kl
@@ -632,6 +634,7 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         teacher_expert_dim=dc.teacher_expert_dim,
         student_action_dim=dc.student_action_dim,
         teacher_action_dim=dc.teacher_action_dim,
+        action_align_mode=dc.action_align_mode,
         enable_vision_distill=dc.enable_vision_distill,
         enable_expert_distill=dc.enable_expert_distill,
         enable_logit_distill=dc.logit_distill,

@@ -50,6 +50,7 @@ distill:
   teacher_expert_dim: 1024
   student_action_dim: 7
   teacher_action_dim: 20
+  action_align_mode: xvla_libero_20to7
 
 # ── 输出路径 ─────────────────────────────────────────────────
 output_dir: outputs/distill_smoke_test
