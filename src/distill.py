@@ -449,9 +449,28 @@ def update_distill(
                         state = student_model.prepare_state(student_batch)
                         lang_tokens = student_batch[f"{OBS_LANGUAGE_TOKENS}"]
                         lang_masks = student_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-                        student_pred_action = student_model.model.sample_actions(
-                            images, img_masks, lang_tokens, lang_masks, state
-                        )
+                        action_model = student_model.model
+                        cache_state_stack: list[tuple[object, str, object]] = []
+                        model_cfg = getattr(action_model, "config", None)
+                        if model_cfg is not None and hasattr(model_cfg, "use_cache"):
+                            cache_state_stack.append((model_cfg, "use_cache", model_cfg.use_cache))
+                            model_cfg.use_cache = True
+                        if hasattr(action_model, "use_cache"):
+                            cache_state_stack.append((action_model, "use_cache", action_model.use_cache))
+                            action_model.use_cache = True
+                        if cache_state_stack:
+                            log_warning_once(
+                                "logit_distill_temp_enable_cache",
+                                "logit_distill 调用 sample_actions() 时会临时启用 use_cache，调用后自动恢复。",
+                            )
+
+                        try:
+                            student_pred_action = action_model.sample_actions(
+                                images, img_masks, lang_tokens, lang_masks, state
+                            )
+                        finally:
+                            for target_obj, attr_name, old_value in reversed(cache_state_stack):
+                                setattr(target_obj, attr_name, old_value)
                         student_pred_action = student_pred_action[..., : dc.student_action_dim]
                         if micro_step == 0 and accelerator.is_main_process:
                             logging.info(

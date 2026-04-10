@@ -29,14 +29,14 @@ distill:
   alpha_distill: 0.2
   alpha_vision_feature: 0.2
   alpha_expert_feature: 0.0
-  alpha_logit: 0.0
+  alpha_logit: 1.0
   # 蒸馏开关
   feature_distill: true
   vision_feature_distill: true
   expert_feature_distill: false
-  logit_distill: false
-  # 冒烟测试保留最短 warmup，并快速进入 vision-only distill
-  warmup_steps: 1
+  logit_distill: true
+  # 冒烟测试：从首步就覆盖 feature + logit 全链路
+  warmup_steps: 0
   distill_ramp_steps: 2
   temperature: 2.0
   action_distill_loss: mse
