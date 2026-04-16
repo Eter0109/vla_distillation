@@ -174,6 +174,7 @@ torchrun --nproc_per_node=4 src/distill.py --config configs/distill_config.yaml
 | `distill_ramp_steps` | 500 | 蒸馏权重从 0 逐步升到 1 的 optimizer step 数 |
 | `temperature` | 2.0 | 仅在 `action_distill_loss=kl` 时生效 |
 | `action_distill_loss` | `mse` | 动作蒸馏损失类型：`mse` / `smooth_l1` / `kl` |
+| `action_distill_horizon` | `1` | 动作蒸馏使用的 chunk 前几步；`1` 表示仅蒸馏首步，`<=0` 表示使用 teacher/student 共有的整段 chunk |
 | `action_align_mode` | `teacher_abs20_to_student_rel7` | 动作对齐模式（默认 teacher 20D 对齐到 student 7D 语义；保留 `xvla_libero_20to7` 兼容模式） |
 | `teacher_transformer_last_layer_attr` | `blocks` | 教师 transformer 最后一层容器名，默认解析 `teacher.model.transformer.blocks[-1]` |
 | `total_steps` | 30000 | 总训练步数 |

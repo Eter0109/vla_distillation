@@ -75,12 +75,12 @@ def test_teacher_abs20_to_student_rel7_geometry():
     state[:, 3:9] = _rot6d_from_matrix(torch.eye(3, dtype=torch.float32).unsqueeze(0))
 
     # target pose
-    action[:, :3] = torch.tensor([[1.1, 1.8, 3.3]], dtype=torch.float32)
-    action[:, 3:9] = _rot6d_from_matrix(_rotz(math.pi / 2.0).unsqueeze(0))
+    action[:, :3] = torch.tensor([[1.025, 1.975, 3.01]], dtype=torch.float32)
+    action[:, 3:9] = _rot6d_from_matrix(_rotz(0.25).unsqueeze(0))
     action[:, 9:10] = torch.tensor([[0.75]], dtype=torch.float32)
 
     rel = xvla_teacher_action20_to_student_rel7(action, teacher_state=state)
-    expected = torch.tensor([[0.1, -0.2, 0.3, 0.0, 0.0, math.pi / 2.0, 0.5]], dtype=torch.float32)
+    expected = torch.tensor([[0.5, -0.5, 0.2, 0.0, 0.0, 0.5, 1.0]], dtype=torch.float32)
     torch.testing.assert_close(rel, expected, rtol=0.0, atol=2e-4)
 
 
@@ -94,12 +94,12 @@ def test_teacher_abs20_to_student_rel7_geometry_with_state8_axis_angle():
     state[:, 6:] = torch.tensor([[0.12, -0.34]], dtype=torch.float32)
 
     # target pose from teacher action: pos + rot6d + gripper
-    action[:, :3] = torch.tensor([[1.1, 1.8, 3.3]], dtype=torch.float32)
-    action[:, 3:9] = _rot6d_from_matrix(_rotz(math.pi / 2.0).unsqueeze(0))
+    action[:, :3] = torch.tensor([[1.025, 1.975, 3.01]], dtype=torch.float32)
+    action[:, 3:9] = _rot6d_from_matrix(_rotz(math.pi / 4.0 + 0.2).unsqueeze(0))
     action[:, 9:10] = torch.tensor([[0.75]], dtype=torch.float32)
 
     rel = xvla_teacher_action20_to_student_rel7(action, teacher_state=state)
-    expected = torch.tensor([[0.1, -0.2, 0.3, 0.0, 0.0, math.pi / 4.0, 0.5]], dtype=torch.float32)
+    expected = torch.tensor([[0.5, -0.5, 0.2, 0.0, 0.0, 0.4, 1.0]], dtype=torch.float32)
     torch.testing.assert_close(rel, expected, rtol=0.0, atol=2e-4)
 
 

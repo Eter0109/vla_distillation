@@ -12,12 +12,12 @@ num_workers: 4
 seed: 42
 save_checkpoint: true
 grad_accum_steps: 32        # 梯度累积（DistillTrainPipelineConfig 扩展字段）
-student_path: /hqlab/workspace/zhaozy/models/smolvla_libero
+student_path: /home/eter/桌面/models/smolvla
 
 # ── 数据集（DatasetConfig）──────────────────────────────────
 dataset:
   repo_id: libero
-  root: /hqlab/workspace/zhaozy/datasets/libero
+  root: /home/eter/桌面/datasets/libero
 
 # ── 优化器 & 调度器：由 distill.py 内联创建，不经过 draccus ────
 # optimizer / scheduler 字段留空，use_policy_training_preset=false 触发代码内 AdamW + cosine
@@ -41,8 +41,9 @@ distill:
   distill_ramp_steps: 500
   temperature: 2.0
   action_distill_loss: mse
+  action_distill_horizon: 1
   # 教师模型
-  teacher_path: /hqlab/workspace/zhaozy/models/xvla-libero-model
+  teacher_path: /home/eter/桌面/models/xvla-libero
   teacher_dtype: float16
   teacher_transformer_last_layer_attr: blocks
   # 适配层维度

@@ -95,6 +95,8 @@ _SUPPORTED_ACTION_ALIGN_MODES = {
     "xvla_libero_20to7",
 }
 
+_LIBERO_RELATIVE_ACTION_SCALE = (0.05, 0.05, 0.05, 0.5, 0.5, 0.5)
+
 
 def _rotate6d_to_axis_angle_torch(rotation_6d: torch.Tensor) -> torch.Tensor:
     """将 6D 旋转表示转换为 axis-angle（3D）。"""
@@ -269,7 +271,8 @@ def xvla_teacher_action20_to_student_rel7(
          - 6<=state_dim<9: pos+axis-angle
       3) delta_pos = target_pos - current_pos
       4) delta_rot = axis_angle(R_target * R_current^{-1})
-      5) gripper: [0, 1] -> [-1, 1] 并 clamp
+      5) 将 delta 转为 LIBERO relative OSC 控制命令尺度并 clamp 到 [-1, 1]
+      6) gripper 与 XVLA LIBERO 评测一致：>0.5 -> +1，否则 -1
     """
     aligned_state = _prepare_teacher_state_for_action(teacher_state, teacher_action)
 
@@ -287,8 +290,20 @@ def xvla_teacher_action20_to_student_rel7(
     delta_rot_mat = torch.matmul(target_rot, current_rot.transpose(-1, -2))
     delta_rot = _rotation_matrix_to_axis_angle_torch(delta_rot_mat)
 
-    mapped_gripper = torch.clamp(target_gripper * 2.0 - 1.0, min=-1.0, max=1.0)
-    rel7 = torch.cat([delta_pos, delta_rot, mapped_gripper], dim=-1)
+    controller_scale = action_flat.new_tensor(_LIBERO_RELATIVE_ACTION_SCALE)
+    relative_command = torch.cat(
+        [
+            delta_pos / controller_scale[:3],
+            delta_rot / controller_scale[3:],
+        ],
+        dim=-1,
+    ).clamp(min=-1.0, max=1.0)
+    mapped_gripper = torch.where(
+        target_gripper > 0.5,
+        torch.ones_like(target_gripper),
+        -torch.ones_like(target_gripper),
+    )
+    rel7 = torch.cat([relative_command, mapped_gripper], dim=-1)
     return rel7.reshape(*teacher_action.shape[:-1], 7)
 
 

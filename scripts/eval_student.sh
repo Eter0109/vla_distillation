@@ -29,9 +29,15 @@ conda activate lerobot
 # =============================================================================
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="${PROJECT_ROOT}/src"
-LEROBOT_ROOT="/hqlab/workspace/zhaozy/lerobot/src"
+LEROBOT_ROOT="${LEROBOT_ROOT:-${PROJECT_ROOT}/../lerobot/src}"
 
 export PYTHONPATH="${LEROBOT_ROOT}:${SRC_DIR}:${PYTHONPATH:-}"
+HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+USE_HF_MIRROR="${USE_HF_MIRROR:-1}"
+if [[ "${USE_HF_MIRROR}" == "1" ]]; then
+    unset no_proxy https_proxy NO_PROXY HTTPS_PROXY HTTP_PROXY http_proxy ALL_PROXY all_proxy
+    export HF_ENDPOINT
+fi
 
 # =============================================================================
 # 默认参数
@@ -42,6 +48,10 @@ N_EPISODES=50
 BATCH_SIZE=10
 LIBERO_TASK="libero_spatial"
 OUTPUT_DIR="${PROJECT_ROOT}/outputs/eval"
+DISTILL_OUTPUT_DIR="${DISTILL_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/action_only_4_10}"
+if [[ "${DISTILL_OUTPUT_DIR}" != /* ]]; then
+    DISTILL_OUTPUT_DIR="${PROJECT_ROOT}/${DISTILL_OUTPUT_DIR}"
+fi
 
 # =============================================================================
 # 解析命令行参数
@@ -65,10 +75,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ ! -d "${LEROBOT_ROOT}/lerobot" ]]; then
+    echo "ERROR: 未找到 lerobot 源码目录: ${LEROBOT_ROOT}"
+    exit 1
+fi
+
 # =============================================================================
 # 自动寻找最新检查点
 # =============================================================================
-CKPT_BASE_DIR="${PROJECT_ROOT}/outputs/distill/checkpoints"
+CKPT_BASE_DIR="${DISTILL_OUTPUT_DIR}/checkpoints"
 
 if [[ -z "${CKPT_PATH}" ]]; then
     # 优先 step_XXXXXXX（按步数降序取最新），其次 best
@@ -111,7 +126,22 @@ echo "评测设备:  ${EVAL_DEVICE}"
 echo "任务:      ${LIBERO_TASK}"
 echo "Episode数: ${N_EPISODES}，Batch: ${BATCH_SIZE}"
 echo "结果输出:  ${EVAL_RUN_DIR}"
+echo "LeRobot:   ${LEROBOT_ROOT}"
+echo "HF_ENDPOINT: ${HF_ENDPOINT}"
+echo "Use Mirror : ${USE_HF_MIRROR}"
 echo "======================================================"
+
+conda run -n lerobot --no-capture-output env PYTHONPATH="${PYTHONPATH}" \
+python - <<PY
+import torch
+
+device = "${EVAL_DEVICE}"
+if device.startswith("cuda") and (not torch.cuda.is_available() or torch.cuda.device_count() <= 0):
+    raise RuntimeError(
+        f"请求使用 {device}，但当前会话没有可见 CUDA 设备。"
+        "请确认 NVIDIA driver / 容器 GPU 透传是否正常，或显式传 --device cpu。"
+    )
+PY
 
 # =============================================================================
 # 方式一：lerobot-eval（需要 gymnasium + libero gym wrapper）
@@ -128,6 +158,7 @@ eval_lerobot() {
         --eval.n_episodes="${N_EPISODES}" \
         --policy.device="${EVAL_DEVICE}" \
         --policy.use_amp=false \
+        --policy.use_cache=true \
         --output_dir="${EVAL_RUN_DIR}"
 }
 

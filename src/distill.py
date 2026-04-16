@@ -41,23 +41,38 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 try:
     from lerobot.rl.wandb_utils import WandBLogger
 except ImportError:
-    WandBLogger = None
+    try:
+        from lerobot.common.wandb_utils import WandBLogger
+    except ImportError:
+        WandBLogger = None
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import (
-    get_step_checkpoint_dir,
-    get_step_identifier,
-    load_training_state,
-    save_checkpoint,
-    update_last_checkpoint,
-)
+try:
+    from lerobot.utils.train_utils import (
+        get_step_checkpoint_dir,
+        get_step_identifier,
+        load_training_state,
+        save_checkpoint,
+        update_last_checkpoint,
+    )
+except ImportError:
+    from lerobot.common.train_utils import (
+        get_step_checkpoint_dir,
+        get_step_identifier,
+        load_training_state,
+        save_checkpoint,
+        update_last_checkpoint,
+    )
+try:
+    from lerobot.datasets.utils import cycle
+except ImportError:
+    from lerobot.utils.utils import cycle
 from lerobot.utils.utils import (
     format_big_number,
     init_logging,
@@ -95,6 +110,7 @@ class DistillConfig:
     distill_ramp_steps: int = 500
     temperature: float = 2.0
     action_distill_loss: str = "mse"  # mse | smooth_l1 | kl
+    action_distill_horizon: int = 1  # >0: distill first N chunk steps; <=0: use full common chunk
     # 教师模型
     teacher_path: str = ""
     teacher_dtype: str = "float16"
@@ -181,6 +197,63 @@ def compute_grad_norm(parameters: list[torch.nn.Parameter]) -> float:
         param_norm = param.grad.detach().float().norm(2)
         total += float(param_norm.item() ** 2)
     return math.sqrt(total)
+
+
+def set_policy_use_cache(policy: PreTrainedPolicy, cfg: TrainPipelineConfig, value: bool) -> list[tuple[Any, bool]]:
+    """Temporarily set known SmolVLA cache flags and return restore state."""
+    model = getattr(policy, "model", None)
+    vlm_with_expert = getattr(model, "vlm_with_expert", None)
+    modules = (
+        cfg.policy,
+        policy,
+        getattr(policy, "config", None),
+        model,
+        getattr(model, "config", None),
+        vlm_with_expert,
+        getattr(vlm_with_expert, "config", None),
+        getattr(vlm_with_expert, "vlm", None),
+        getattr(getattr(vlm_with_expert, "vlm", None), "config", None),
+        getattr(vlm_with_expert, "lm_expert", None),
+        getattr(getattr(vlm_with_expert, "lm_expert", None), "config", None),
+    )
+
+    restore_state: list[tuple[Any, bool]] = []
+    seen: set[int] = set()
+    for module in modules:
+        if module is None or id(module) in seen or not hasattr(module, "use_cache"):
+            continue
+        seen.add(id(module))
+        restore_state.append((module, module.use_cache))
+        module.use_cache = value
+    return restore_state
+
+
+def restore_policy_use_cache(restore_state: list[tuple[Any, bool]]) -> None:
+    for module, value in restore_state:
+        module.use_cache = value
+
+
+def ensure_runtime_ready(cfg: DistillTrainPipelineConfig) -> None:
+    """Fail fast on missing local resources or unavailable CUDA."""
+    required_paths = {
+        "student_path": Path(cfg.student_path),
+        "distill.teacher_path": Path(cfg.distill.teacher_path),
+    }
+    dataset_root = getattr(cfg.dataset, "root", None)
+    if dataset_root:
+        required_paths["dataset.root"] = Path(dataset_root)
+
+    for field_name, path in required_paths.items():
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{field_name} 不存在: {path}。请确认本机模型/数据集路径配置正确。"
+            )
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
+        raise RuntimeError(
+            "未检测到可见 CUDA 设备，蒸馏训练不会回退到 CPU。"
+            "请确认 NVIDIA driver、容器 GPU 透传和当前会话的 CUDA 可见性。"
+        )
 
 
 # =============================================================================
@@ -491,6 +564,8 @@ def update_distill(
                     else:
                         s_act = student_pred_action.float()
                         min_T = min(s_act.shape[1], t_action.shape[1])
+                        if dc.action_distill_horizon > 0:
+                            min_T = min(min_T, dc.action_distill_horizon)
                         s_act = s_act[:, :min_T, :]
                         t_act = t_action[:, :min_T, : dc.teacher_action_dim].float()
                         s_act_aligned = adapters.adapt_student_action(s_act)
@@ -527,6 +602,7 @@ def update_distill(
 
                         distill_loss = distill_loss + dc.alpha_logit * loss_action
                         log["loss_action_distill"] = loss_action.item()
+                        log["action_distill_steps"] = float(min_T)
                         # 0: mse, 1: smooth_l1, 2: kl
                         log["action_distill_loss_type"] = {"mse": 0.0, "smooth_l1": 1.0, "kl": 2.0}[loss_type]
 
@@ -586,6 +662,7 @@ def update_distill(
 def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | None = None):
     """蒸馏训练主函数，结构对齐 lerobot_train.train。"""
     cfg.validate()
+    ensure_runtime_ready(cfg)
 
     if accelerator is None:
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -632,8 +709,9 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
             logging.info(colored("Logs 仅保存本地。", "yellow", attrs=["bold"]))
 
     device = accelerator.device
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     # ── 数据集 ───────────────────────────────────────────────────────────────
     if is_main:
@@ -825,7 +903,8 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
                 f"expert_distill={dc.enable_expert_distill}，"
                 f"logit_distill={dc.logit_distill}，"
                 f"action_align_mode={dc.action_align_mode}，"
-                f"action_distill_loss={dc.action_distill_loss}",
+                f"action_distill_loss={dc.action_distill_loss}，"
+                f"action_distill_horizon={dc.action_distill_horizon}",
                 "green",
                 attrs=["bold"],
             )
@@ -904,16 +983,21 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
             if is_main:
                 logging.info(f"Checkpoint after step {step}")
                 ckpt_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(
-                    checkpoint_dir=ckpt_dir,
-                    step=step,
-                    cfg=cfg,
-                    policy=accelerator.unwrap_model(student),
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                )
+                unwrapped_student = accelerator.unwrap_model(student)
+                use_cache_restore_state = set_policy_use_cache(unwrapped_student, cfg, True)
+                try:
+                    save_checkpoint(
+                        checkpoint_dir=ckpt_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=unwrapped_student,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
+                finally:
+                    restore_policy_use_cache(use_cache_restore_state)
                 # 额外保存 adapters 权重（与学生 checkpoint 同目录）
                 adapters_path = ckpt_dir / "adapters.pt"
                 torch.save(accelerator.unwrap_model(adapters).state_dict(), adapters_path)
