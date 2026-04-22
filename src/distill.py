@@ -350,40 +350,11 @@ def resolve_resume_checkpoint_path(cfg: DistillTrainPipelineConfig) -> Path | No
     return resume_ckpt_path
 
 
-def resolve_teacher_last_layer(
-    teacher: PreTrainedPolicy,
-    cfg: DistillTrainPipelineConfig,
-) -> tuple[torch.nn.Module, str]:
-    """Resolve the teacher transformer's last layer for feature hooking."""
-    layer_attr = cfg.distill.teacher_transformer_last_layer_attr
-    transformer = getattr(getattr(teacher, "model", None), "transformer", None)
-    if transformer is None:
-        raise AttributeError("Teacher model is missing `model.transformer`; cannot capture `teacher_last`.")
-
-    layer_container = getattr(transformer, layer_attr, None)
-    layer_path = f"teacher.model.transformer.{layer_attr}"
-    if layer_container is None:
-        available = [name for name in ("blocks", "layers") if hasattr(transformer, name)]
-        raise AttributeError(
-            f"Teacher transformer has no `{layer_attr}` container at `{layer_path}`. "
-            f"Available candidates: {available or 'none'}."
-        )
-
-    try:
-        if len(layer_container) == 0:
-            raise ValueError(f"`{layer_path}` is empty.")
-        return layer_container[-1], f"{layer_path}[-1]"
-    except TypeError as exc:
-        raise TypeError(
-            f"`{layer_path}` is not an indexable layer container; got type {type(layer_container).__name__}."
-        ) from exc
-
-
 def extract_teacher_feature_targets(
     teacher: PreTrainedPolicy,
     teacher_batch: dict,
     cfg: DistillTrainPipelineConfig,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, str, str]:
+) -> torch.Tensor:
     """Run XVLA encoder once to capture stable feature distillation targets."""
 
     t_inputs = teacher._build_model_inputs(teacher_batch)
@@ -394,8 +365,7 @@ def extract_teacher_feature_targets(
         pixel_values=t_inputs["image_input"],
         image_mask=t_inputs["image_mask"],
     )
-    t_vision = enc["vlm_features"].float()
-    return t_vision, None, "", ""
+    return enc["vlm_features"].float()
 
 
 # =============================================================================
@@ -430,6 +400,7 @@ def update_distill(
     enable_vision_distill = dc.enable_vision_distill
     enable_expert_distill = dc.enable_expert_distill
     enable_logit_distill = dc.logit_distill
+    need_action_path = enable_expert_distill or enable_logit_distill
     log = {}
     grad_norm = torch.tensor(0.0, device=accelerator.device)
     student_grad_norm = 0.0
@@ -465,37 +436,97 @@ def update_distill(
             if distill_scale > 0 and (enable_vision_distill or enable_expert_distill or enable_logit_distill):
                 t_vision = None
                 t_action = None
+                t_expert = None
+                s_expert = None
+                student_pred_action = None
 
                 if teacher is not None and teacher_batch is not None:
                     teacher_dtype = getattr(teacher.model, "_get_target_dtype", lambda: torch.float16)()
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=teacher_dtype):
                         if enable_vision_distill:
-                            t_vision, _, _, _ = (
-                                extract_teacher_feature_targets(teacher, teacher_batch, cfg)
-                            )
-                        if enable_logit_distill:
+                            t_vision = extract_teacher_feature_targets(teacher, teacher_batch, cfg)
+                        if need_action_path:
                             t_inputs = teacher._build_model_inputs(teacher_batch)
-                            t_action = teacher.model.generate_actions(
-                                input_ids=t_inputs["input_ids"],
-                                image_input=t_inputs["image_input"],
-                                image_mask=t_inputs["image_mask"],
-                                domain_id=t_inputs["domain_id"],
-                                proprio=t_inputs["proprio"],
-                                steps=teacher.config.num_denoising_steps,
-                            ).float()
+                            teacher_hook_specs = (
+                                {
+                                    "teacher_expert": HookSpec(
+                                        module=teacher.model.transformer.norm,
+                                        detach=True,
+                                        clone=True,
+                                    )
+                                }
+                                if enable_expert_distill
+                                else {}
+                            )
+                            with MultiHookManager(teacher_hook_specs) as t_hooks:
+                                t_action = teacher.model.generate_actions(
+                                    input_ids=t_inputs["input_ids"],
+                                    image_input=t_inputs["image_input"],
+                                    image_mask=t_inputs["image_mask"],
+                                    domain_id=t_inputs["domain_id"],
+                                    proprio=t_inputs["proprio"],
+                                    steps=teacher.config.num_denoising_steps,
+                                ).float()
+                                if enable_expert_distill:
+                                    t_expert_raw = t_hooks["teacher_expert"].output
+                                    t_expert = t_expert_raw.float() if t_expert_raw is not None else None
+
+                if need_action_path:
+                    action_model = student_model.model
+                    action_hook_specs = (
+                        {
+                            "student_expert": HookSpec(
+                                module=action_model.action_out_proj,
+                                detach=False,
+                                clone=False,
+                                capture="input",
+                            )
+                        }
+                        if enable_expert_distill
+                        else {}
+                    )
+                    with MultiHookManager(action_hook_specs) as a_hooks:
+                        with accelerator.autocast():
+                            images, img_masks = student_model.prepare_images(student_batch)
+                            state = student_model.prepare_state(student_batch)
+                            lang_tokens = student_batch[f"{OBS_LANGUAGE_TOKENS}"]
+                            lang_masks = student_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+                            cache_state_stack: list[tuple[object, str, object]] = []
+                            model_cfg = getattr(action_model, "config", None)
+                            if model_cfg is not None and hasattr(model_cfg, "use_cache"):
+                                cache_state_stack.append((model_cfg, "use_cache", model_cfg.use_cache))
+                                model_cfg.use_cache = True
+                            if hasattr(action_model, "use_cache"):
+                                cache_state_stack.append((action_model, "use_cache", action_model.use_cache))
+                                action_model.use_cache = True
+                            if cache_state_stack:
+                                log_warning_once(
+                                    "logit_distill_temp_enable_cache",
+                                    "decision-path distillation 调用 sample_actions() 时会临时启用 use_cache，调用后自动恢复。",
+                                )
+                            try:
+                                student_pred_action = action_model.sample_actions(
+                                    images, img_masks, lang_tokens, lang_masks, state
+                                )
+                            finally:
+                                for target_obj, attr_name, old_value in reversed(cache_state_stack):
+                                    setattr(target_obj, attr_name, old_value)
+                        student_pred_action = student_pred_action[..., : dc.student_action_dim]
+                        if enable_expert_distill:
+                            s_expert_raw = a_hooks["student_expert"].output
+                            s_expert = s_expert_raw.float() if s_expert_raw is not None else None
 
                 if enable_vision_distill or enable_expert_distill:
-                    vlm_with_expert = student_model.model.vlm_with_expert
-                    se_cached = vlm_with_expert._last_expert_output
                     sv_raw = s_hooks["student_vision"].output if student_vision_module else None
                     sv = sv_raw.float() if sv_raw is not None else None
+
                     if micro_step == 0 and accelerator.is_main_process:
                         logging.info(
                             f"[DEBUG] feature shapes: "
                             f"student_vision={tuple(sv.shape) if sv is not None else None} "
                             f"teacher_vision={tuple(t_vision.shape) if t_vision is not None else None} "
-                            f"student_expert={tuple(se_cached.shape) if se_cached is not None else None} "
-                            f"teacher_last=None"
+                            f"student_expert={tuple(s_expert.shape) if s_expert is not None else None} "
+                            f"teacher_expert={tuple(t_expert.shape) if t_expert is not None else None}"
                         )
                     if enable_vision_distill:
                         if sv is None or t_vision is None:
@@ -511,55 +542,50 @@ def update_distill(
                             log["loss_vision_feat"] = loss_vis.item()
 
                     if enable_expert_distill:
-                        log_warning_once(
-                            "expert_distill_disabled",
-                            "expert_feature_distill 已暂时停用：当前 teacher expert target 仍依赖 dummy_action/t=1，不再参与训练。",
-                        )
+                        if t_expert is None:
+                            log_warning_once(
+                                "expert_distill_missing_teacher",
+                                "expert_feature_distill=True 但 teacher expert target 为 None，跳过 expert 特征蒸馏。",
+                            )
+                        elif s_expert is None:
+                            log_warning_once(
+                                "expert_distill_missing_student",
+                                "expert_feature_distill=True 但 student expert source 为 None，跳过 expert 特征蒸馏。",
+                            )
+                        elif student_pred_action is not None and not student_pred_action.requires_grad:
+                            log_warning_once(
+                                "decision_path_nondiff_student",
+                                "student 决策路径当前不可微，已跳过 decision-path 的 expert/logit 蒸馏；如需启用，请切换到可微动作输出接口。",
+                            )
+                        else:
+                            s_expert = align_seq_len(s_expert, t_expert)
+                            s_expert_proj = adapters.adapt_expert(s_expert)
+                            loss_expert = F.mse_loss(s_expert_proj, t_expert.detach())
+                            distill_loss = distill_loss + dc.expert_loss_weight * loss_expert
+                            log["loss_expert_feat"] = loss_expert.item()
+
+                if need_action_path and micro_step == 0 and accelerator.is_main_process:
+                    logging.info(
+                        f"[DEBUG] action shapes: "
+                        f"student_action={tuple(student_pred_action.shape) if student_pred_action is not None else None} "
+                        f"teacher_action={tuple(t_action.shape) if t_action is not None else None}"
+                    )
 
                 if enable_logit_distill:
-                    with accelerator.autocast():
-                        images, img_masks = student_model.prepare_images(student_batch)
-                        state = student_model.prepare_state(student_batch)
-                        lang_tokens = student_batch[f"{OBS_LANGUAGE_TOKENS}"]
-                        lang_masks = student_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-                        action_model = student_model.model
-                        cache_state_stack: list[tuple[object, str, object]] = []
-                        model_cfg = getattr(action_model, "config", None)
-                        if model_cfg is not None and hasattr(model_cfg, "use_cache"):
-                            cache_state_stack.append((model_cfg, "use_cache", model_cfg.use_cache))
-                            model_cfg.use_cache = True
-                        if hasattr(action_model, "use_cache"):
-                            cache_state_stack.append((action_model, "use_cache", action_model.use_cache))
-                            action_model.use_cache = True
-                        if cache_state_stack:
-                            log_warning_once(
-                                "logit_distill_temp_enable_cache",
-                                "logit_distill 调用 sample_actions() 时会临时启用 use_cache，调用后自动恢复。",
-                            )
-
-                        try:
-                            student_pred_action = action_model.sample_actions(
-                                images, img_masks, lang_tokens, lang_masks, state
-                            )
-                        finally:
-                            for target_obj, attr_name, old_value in reversed(cache_state_stack):
-                                setattr(target_obj, attr_name, old_value)
-                        student_pred_action = student_pred_action[..., : dc.student_action_dim]
-                        if micro_step == 0 and accelerator.is_main_process:
-                            logging.info(
-                                f"[DEBUG] action shapes: "
-                                f"student_action={tuple(student_pred_action.shape)} teacher_action={tuple(t_action.shape) if t_action is not None else None}"
-                            )
-
                     if t_action is None:
                         log_warning_once(
                             "logit_distill_missing_teacher",
                             "logit_distill=True 但 teacher_action 为 None，跳过 logit 蒸馏。",
                         )
+                    elif student_pred_action is None:
+                        log_warning_once(
+                            "logit_distill_missing_student_action",
+                            "logit_distill=True 但 student sample_actions() 未返回动作，跳过 logit 蒸馏。",
+                        )
                     elif not student_pred_action.requires_grad:
                         log_warning_once(
-                            "logit_distill_nondiff_student",
-                            "student sample_actions() 当前不可微，已跳过 logit distill；如需启用，请切换到可微动作输出接口。",
+                            "decision_path_nondiff_student",
+                            "student 决策路径当前不可微，已跳过 decision-path 的 expert/logit 蒸馏；如需启用，请切换到可微动作输出接口。",
                         )
                     else:
                         s_act = student_pred_action.float()

@@ -24,11 +24,23 @@ class FeatureHook:
         hook.close()         # 移除钩子，避免内存泄漏
     """
 
-    def __init__(self, module: nn.Module, detach: bool = True, clone: bool = True):
+    def __init__(
+        self,
+        module: nn.Module,
+        detach: bool = True,
+        clone: bool = True,
+        capture: str = "output",
+    ):
         self.output: Any = None
         self.detach = detach
         self.clone = clone
-        self._handle = module.register_forward_hook(self._hook_fn)
+        self.capture = capture
+        if capture == "output":
+            self._handle = module.register_forward_hook(self._hook_fn)
+        elif capture == "input":
+            self._handle = module.register_forward_pre_hook(self._pre_hook_fn)
+        else:
+            raise ValueError(f"Unsupported hook capture mode: {capture}")
 
     def _store(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
         if tensor is None:
@@ -55,6 +67,14 @@ class FeatureHook:
                         tensor = v
                         break
             self.output = self._store(tensor)
+
+    def _pre_hook_fn(self, module: nn.Module, input: Any) -> None:
+        tensor = None
+        if isinstance(input, tuple):
+            tensor = input[0] if input else None
+        elif isinstance(input, torch.Tensor):
+            tensor = input
+        self.output = self._store(tensor)
 
     def close(self) -> None:
         """移除钩子，释放资源。"""
@@ -88,7 +108,12 @@ class MultiHookManager:
 
     def __init__(self, name_to_module: dict[str, nn.Module | "HookSpec"]):
         self._hooks: dict[str, FeatureHook] = {
-            name: FeatureHook(spec.module, detach=spec.detach, clone=spec.clone)
+            name: FeatureHook(
+                spec.module,
+                detach=spec.detach,
+                clone=spec.clone,
+                capture=spec.capture,
+            )
             for name, spec in {
                 name: (value if isinstance(value, HookSpec) else HookSpec(module=value))
                 for name, value in name_to_module.items()
@@ -114,3 +139,4 @@ class HookSpec:
     module: nn.Module
     detach: bool = True
     clone: bool = True
+    capture: str = "output"
