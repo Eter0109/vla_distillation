@@ -7,11 +7,12 @@
 batch_size: 4
 steps: 300000
 log_freq: 50
-save_freq: 200
+save_freq: 10000
 num_workers: 4
 seed: 42
 save_checkpoint: true
-grad_accum_steps: 32        # 梯度累积（DistillTrainPipelineConfig 扩展字段）
+grad_accum_steps: 64        # 单卡 gbs=256 => 4 x 1 x 64
+job_name: task_only_gbs256_1gpu
 student_path: /home/eter/桌面/models/smolvla
 
 # ── 数据集（DatasetConfig）──────────────────────────────────
@@ -27,14 +28,14 @@ use_policy_training_preset: false
 distill:
   # 损失权重
   alpha_task: 1.0
-  alpha_distill: 0.2
-  alpha_vision_feature: 0.2
-  alpha_expert_feature: 0.2
+  alpha_distill: 0.0
+  alpha_vision_feature: 0.0
+  alpha_expert_feature: 0.0
   alpha_logit: 0.0
   # 蒸馏开关
-  feature_distill: true
-  vision_feature_distill: true
-  expert_feature_distill: true
+  feature_distill: false
+  vision_feature_distill: false
+  expert_feature_distill: false
   logit_distill: false
   # 预热/爬坡步数（按 optimizer step 计）
   warmup_steps: 0
@@ -56,7 +57,7 @@ distill:
   action_align_mode: teacher_abs20_to_student_rel7
 
 # ── 输出路径 ─────────────────────────────────────────────────
-output_dir: outputs/action_only_4_10
+output_dir: outputs/task_only_gbs256_1gpu
 
 # ── WandB（WandBConfig）──────────────────────────────────────
 wandb:

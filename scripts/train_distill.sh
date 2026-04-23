@@ -6,8 +6,13 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SRC_DIR="${PROJECT_ROOT}/src"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${PROJECT_ROOT}/../lerobot/src}"
 
-DEFAULT_STUDENT=0,1,2,3
+DEFAULT_STUDENT=0
 DEFAULT_CONFIG="${PROJECT_ROOT}/configs/distill_config.yaml"
+LOG_DIR="${PROJECT_ROOT}/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/train_distill_$(date +%Y%m%d_%H%M%S).log"
+
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 STUDENT_DEVICES=${STUDENT_DEVICES:-$DEFAULT_STUDENT}
 DISTILL_CONFIG=${DISTILL_CONFIG:-$DEFAULT_CONFIG}
@@ -52,6 +57,7 @@ echo " 配置文件   : $DISTILL_CONFIG"
 echo " LeRobot    : $LEROBOT_ROOT"
 echo " HF_ENDPOINT: ${HF_ENDPOINT}"
 echo " Use Mirror : ${USE_HF_MIRROR}"
+echo " 日志文件   : ${LOG_FILE}"
 echo "====================================================================="
 
 cd "${PROJECT_ROOT}"
