@@ -669,9 +669,10 @@ def update_distill(
         "in_warmup": float(in_warmup),
         "micro_step": float(micro_step + 1),
         "optimizer_step": float(optimizer_step + int(accelerator.sync_gradients)),
-        "optimizer_step_applied": float(accelerator.sync_gradients),
-        "student_grad_norm": student_grad_norm,
     })
+    if accelerator.sync_gradients:
+        log["optimizer_step_applied"] = 1.0
+        log["student_grad_norm"] = student_grad_norm
 
     train_metrics.loss = total_loss.item()
     train_metrics.grad_norm = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
@@ -908,6 +909,7 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
         accelerator=accelerator,
     )
     optimizer_step = step // max(1, cfg.grad_accum_steps)
+    sync_step_count = optimizer_step
     task_loss_interval_sum = 0.0
     task_loss_interval_count = 0
     task_loss_ema: float | None = None
@@ -969,7 +971,9 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
             task_loss_ema = task_loss_ema_beta * task_loss_ema + (1 - task_loss_ema_beta) * raw_task_loss
 
         step += 1
-        optimizer_step += int(output_dict.get("optimizer_step_applied", 0.0))
+        sync_applied = int(output_dict.get("optimizer_step_applied", 0.0))
+        optimizer_step += sync_applied
+        sync_step_count += sync_applied
         if is_main:
             progbar.update(1)
         train_tracker.step()
@@ -998,6 +1002,7 @@ def train_distill(cfg: DistillTrainPipelineConfig, accelerator: Accelerator | No
                     "distill/loss_task_ema": task_loss_ema,
                     "distill/micro_step": float(step),
                     "distill/optimizer_step": float(optimizer_step),
+                    "distill/sync_step_count": float(sync_step_count),
                 })
                 wandb_logger.log_dict(wandb_log, step)
             train_tracker.reset_averages()
