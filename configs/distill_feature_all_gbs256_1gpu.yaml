@@ -1,0 +1,65 @@
+# ============================================================
+# distill_feature_all_gbs256_1gpu.yaml — feature 全开训练配置
+# ============================================================
+
+# ── 训练循环 ────────────────────────────────────────────────
+batch_size: 1
+steps: 300000
+log_freq: 50
+save_freq: 10000
+num_workers: 4
+seed: 42
+save_checkpoint: true
+grad_accum_steps: 256
+job_name: feature_all_gbs256_1gpu
+student_path: /home/eter/桌面/models/smolvla
+
+# ── 数据集 ──────────────────────────────────────────────────
+dataset:
+  repo_id: libero
+  root: /home/eter/桌面/datasets/libero
+
+# ── 优化器 & 调度器 ─────────────────────────────────────────
+use_policy_training_preset: false
+
+# ── 蒸馏配置 ─────────────────────────────────────────────────
+distill:
+  alpha_task: 1.0
+  alpha_distill: 0.2
+  alpha_vision_feature: 0.2
+  alpha_expert_feature: 0.2
+  alpha_logit: 0.0
+
+  feature_distill: true
+  vision_feature_distill: true
+  expert_feature_distill: true
+  logit_distill: false
+  student_train_expert_only: false
+  student_freeze_vision_encoder: false
+  student_use_cache: false
+
+  warmup_steps: 0
+  distill_ramp_steps: 500
+  temperature: 2.0
+  action_distill_loss: mse
+  action_distill_horizon: 1
+
+  teacher_path: /home/eter/桌面/models/xvla-libero
+  teacher_dtype: float16
+  teacher_transformer_last_layer_attr: blocks
+
+  student_vision_dim: 960
+  teacher_vision_dim: 1024
+  student_expert_dim: 480
+  teacher_expert_dim: 1024
+  student_action_dim: 7
+  teacher_action_dim: 20
+  action_align_mode: teacher_abs20_to_student_rel7
+
+# ── 输出路径 ─────────────────────────────────────────────────
+output_dir: outputs/feature_all_gbs256_1gpu
+
+# ── WandB ───────────────────────────────────────────────────
+wandb:
+  enable: true
+  project: vla_distillation

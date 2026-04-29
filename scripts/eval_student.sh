@@ -48,7 +48,7 @@ N_EPISODES=50
 BATCH_SIZE=10
 LIBERO_TASK="libero_spatial"
 OUTPUT_DIR="${PROJECT_ROOT}/outputs/eval"
-DISTILL_OUTPUT_DIR="${DISTILL_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/action_only_4_10}"
+DISTILL_OUTPUT_DIR="${DISTILL_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/task_only_gbs256_1gpu}"
 if [[ "${DISTILL_OUTPUT_DIR}" != /* ]]; then
     DISTILL_OUTPUT_DIR="${PROJECT_ROOT}/${DISTILL_OUTPUT_DIR}"
 fi
@@ -86,8 +86,13 @@ fi
 CKPT_BASE_DIR="${DISTILL_OUTPUT_DIR}/checkpoints"
 
 if [[ -z "${CKPT_PATH}" ]]; then
-    # 优先 step_XXXXXXX（按步数降序取最新），其次 best
-    LATEST=$(ls -d "${CKPT_BASE_DIR}"/step_* 2>/dev/null | sort -V | tail -n 1 || true)
+    # 优先数字步数目录 / step_XXXXXXX（按步数降序取最新），其次 best
+    LATEST=$(
+        {
+            ls -d "${CKPT_BASE_DIR}"/[0-9]* 2>/dev/null || true
+            ls -d "${CKPT_BASE_DIR}"/step_* 2>/dev/null || true
+        } | sort -V | tail -n 1
+    )
     if [[ -n "${LATEST}" ]]; then
         CKPT_PATH="${LATEST}"
     elif [[ -d "${CKPT_BASE_DIR}/best" ]]; then
@@ -106,12 +111,18 @@ if [[ ! -d "${CKPT_PATH}" ]]; then
     echo "ERROR: 检查点目录不存在: ${CKPT_PATH}"
     exit 1
 fi
-if [[ ! -f "${CKPT_PATH}/config.json" ]]; then
-    echo "ERROR: 检查点目录缺少 config.json: ${CKPT_PATH}"
+
+POLICY_PATH="${CKPT_PATH}"
+if [[ -d "${CKPT_PATH}/pretrained_model" ]]; then
+    POLICY_PATH="${CKPT_PATH}/pretrained_model"
+fi
+
+if [[ ! -f "${POLICY_PATH}/config.json" ]]; then
+    echo "ERROR: 检查点模型目录缺少 config.json: ${POLICY_PATH}"
     exit 1
 fi
-if [[ ! -f "${CKPT_PATH}/model.safetensors" ]]; then
-    echo "ERROR: 检查点目录缺少 model.safetensors: ${CKPT_PATH}"
+if [[ ! -f "${POLICY_PATH}/model.safetensors" ]]; then
+    echo "ERROR: 检查点模型目录缺少 model.safetensors: ${POLICY_PATH}"
     exit 1
 fi
 
@@ -122,6 +133,7 @@ mkdir -p "${EVAL_RUN_DIR}"
 echo "======================================================"
 echo "SmolVLA 学生模型评测"
 echo "检查点:    ${CKPT_PATH}"
+echo "模型目录:  ${POLICY_PATH}"
 echo "评测设备:  ${EVAL_DEVICE}"
 echo "任务:      ${LIBERO_TASK}"
 echo "Episode数: ${N_EPISODES}，Batch: ${BATCH_SIZE}"
@@ -151,7 +163,7 @@ eval_lerobot() {
     GPU_ID="${EVAL_DEVICE#cuda:}"
     CUDA_VISIBLE_DEVICES="${GPU_ID}" \
     python "${LEROBOT_ROOT}/lerobot/scripts/lerobot_eval.py" \
-        --policy.path="${CKPT_PATH}" \
+        --policy.path="${POLICY_PATH}" \
         --env.type="libero" \
         --env.task="${LIBERO_TASK}" \
         --eval.batch_size="${BATCH_SIZE}" \
@@ -181,7 +193,7 @@ from student_policy_wrapper import load_student_policy
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("eval")
 
-ckpt_path = "${CKPT_PATH}"
+ckpt_path = "${POLICY_PATH}"
 device    = "${EVAL_DEVICE}"
 out_dir   = Path("${EVAL_RUN_DIR}")
 out_dir.mkdir(parents=True, exist_ok=True)
